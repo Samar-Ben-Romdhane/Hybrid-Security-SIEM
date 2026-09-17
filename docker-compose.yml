@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: honeypot_postgres_db
+    environment:
+      POSTGRES_DB: honeydb
+      POSTGRES_USER: honeyuser
+      POSTGRES_PASSWORD: honeypassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_volume_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U honeyuser -d honeydb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: honeypot_traffic_analyzer
+    environment:
+      - DATABASE_URL=postgresql://honeyuser:honeypassword@db:5432/honeydb
+      - PORT=3000
+    ports:
+      - "3500:3000"  # Core Express Dashboard API (mapped to 3500 to avoid Grafana port 3000 conflict)
+      - "2222:2222"  # SSH Decoy
+      - "2323:2323"  # Telnet Decoy
+      - "8085:8080"  # HTTP Admin Decoy (mapped to 8085 on host to avoid port 8080 conflict)
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_volume_data:

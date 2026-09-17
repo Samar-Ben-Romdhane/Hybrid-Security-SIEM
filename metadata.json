@@ -1,0 +1,6 @@
+{
+  "name": "Honeypot Traffic Analyzer",
+  "description": "A live security dashboard that simulates decoy SSH, Telnet, and HTTP services to monitor, capture, geolocate, and visually map malicious traffic.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
