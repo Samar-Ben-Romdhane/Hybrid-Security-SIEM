@@ -25,6 +25,8 @@ function requireBearerToken(expectedToken: string) {
     next();
   };
 }
+const wazuhAuth = requireBearerToken(process.env.WAZUH_WEBHOOK_TOKEN || '');
+const prowlerAuth = requireBearerToken(process.env.PROWLER_WEBHOOK_TOKEN || '');
 
 // --- Pre-calculated Mock Geolocation database for realism & performance ---
 const LOCATIONS = [
