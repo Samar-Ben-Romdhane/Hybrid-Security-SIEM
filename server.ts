@@ -14,6 +14,17 @@ const PORT = Number(process.env.PORT) || 3000;
 const DB_FILE = './honeypot_db.json';
 
 app.use(express.json());
+function requireBearerToken(expectedToken: string) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const authorization = req.headers.authorization;
+
+    if (!expectedToken || authorization !== `Bearer ${expectedToken}`) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    next();
+  };
+}
 
 // --- Pre-calculated Mock Geolocation database for realism & performance ---
 const LOCATIONS = [
