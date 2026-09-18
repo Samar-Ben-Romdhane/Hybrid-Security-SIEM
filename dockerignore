@@ -1,0 +1,11 @@
+node_modules
+dist
+.git
+.github
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+README.md
+honeypot_db.json
