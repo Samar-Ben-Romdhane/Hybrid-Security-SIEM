@@ -22,6 +22,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    env_file:
+      - .env
     container_name: honeypot_traffic_analyzer
     environment:
       - DATABASE_URL=postgresql://honeyuser:honeypassword@db:5432/honeydb
