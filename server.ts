@@ -518,7 +518,7 @@ app.post('/api/simulate', (req, res) => {
 });
 
 // POST /api/wazuh/webhook - Ingest Wazuh alerts
-app.post('/api/wazuh/webhook', (req, res) => {
+app.post('/api/wazuh/webhook', wazuhAuth, (req, res) => {
   const alert = req.body;
   // A typical Wazuh alert has `rule`, `agent`, `location`, `data`
   
@@ -547,7 +547,7 @@ app.post('/api/wazuh/webhook', (req, res) => {
 });
 
 // POST /api/prowler/upload - Ingest Prowler JSON output
-app.post('/api/prowler/upload', (req, res) => {
+app.post('/api/prowler/upload', prowlerAuth, (req, res) => {
   const prowlerData = req.body;
   
   if (!Array.isArray(prowlerData)) {
