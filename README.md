@@ -1,4 +1,4 @@
-# 🚨 Honeypot Traffic Analyzer
+# 🚨 Hybrid-Security-SIEM
 
 A polished, high-performance **Honeypot Traffic Analyzer & Intruder Geomapping Dashboard** built on a fullstack **React (Vite) + Node.js (Express)** architecture. 
 
