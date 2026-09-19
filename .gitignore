@@ -6,3 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# esbuild output from `npm run dev` (npm run build writes to dist/ instead, already ignored above)
+/server.cjs
+/server.cjs.map

@@ -5,18 +5,18 @@ services:
     image: postgres:15-alpine
     container_name: honeypot_postgres_db
     environment:
-      POSTGRES_DB: honeydb
-      POSTGRES_USER: honeyuser
-      POSTGRES_PASSWORD: honeypassword
-    ports:
-      - "5432:5432"
+      POSTGRES_DB: ${POSTGRES_DB:-honeydb}
+      POSTGRES_USER: ${POSTGRES_USER:-honeyuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your .env file}
     volumes:
       - postgres_volume_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U honeyuser -d honeydb"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-honeyuser} -d ${POSTGRES_DB:-honeydb}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    # No host port published: only the analyzer service (on the internal
+    # Docker network) needs to reach Postgres.
 
   analyzer:
     build:
@@ -26,7 +26,7 @@ services:
       - .env
     container_name: honeypot_traffic_analyzer
     environment:
-      - DATABASE_URL=postgresql://honeyuser:honeypassword@db:5432/honeydb
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-honeyuser}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-honeydb}
       - PORT=3000
     ports:
       - "3500:3000"  # Core Express Dashboard API (mapped to 3500 to avoid Grafana port 3000 conflict)

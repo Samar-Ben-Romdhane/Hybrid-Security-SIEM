@@ -37,3 +37,10 @@ export interface SystemSettings {
   alertThreshold: number;
   decoyProfile: 'standard' | 'aggressive' | 'stealth';
 }
+
+export interface ProwlerMetrics {
+  total_nsg_checks: number;
+  fails: number;
+  passes: number;
+  updated_at: string | null;
+}

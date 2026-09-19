@@ -1,32 +1,26 @@
 import express from 'express';
 import path from 'path';
-import fs from 'fs';
 import net from 'net';
 import http from 'http';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
+import { Pool } from 'pg';
 import { AttackEvent, SystemSettings } from './src/types';
 
 dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
-const DB_FILE = './honeypot_db.json';
 
 app.use(express.json());
-function requireBearerToken(expectedToken: string) {
-  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const authorization = req.headers.authorization;
 
-    if (!expectedToken || authorization !== `Bearer ${expectedToken}`) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+// --- Postgres connection pool ---
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-    next();
-  };
-}
-const wazuhAuth = requireBearerToken(process.env.WAZUH_WEBHOOK_TOKEN || '');
-const prowlerAuth = requireBearerToken(process.env.PROWLER_WEBHOOK_TOKEN || '');
+pool.on('error', (err) => {
+  // A background/idle client error should not crash the whole server.
+  console.error('Unexpected Postgres pool error:', err);
+});
 
 // --- Pre-calculated Mock Geolocation database for realism & performance ---
 const LOCATIONS = [
@@ -71,45 +65,124 @@ const CREDENTIALS = {
   ]
 };
 
-// State Store
+interface ProwlerMetrics {
+  total_nsg_checks: number;
+  fails: number;
+  passes: number;
+  updated_at: string | null;
+}
+
+// In-memory caches, mirrored to/from Postgres so the existing synchronous
+// aggregation logic (stats/threats/pagination) doesn't need a full rewrite.
 let events: AttackEvent[] = [];
 let settings: SystemSettings = {
   simulationSpeed: 'normal',
   alertThreshold: 10,
   decoyProfile: 'standard'
 };
+let latestProwlerMetrics: ProwlerMetrics = {
+  total_nsg_checks: 0,
+  fails: 0,
+  passes: 0,
+  updated_at: null
+};
 
 // SSE active channels
 let sseClients: any[] = [];
 
-// Load state or seed default coordinates to look gorgeous
-function loadDatabase() {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      const data = fs.readFileSync(DB_FILE, 'utf-8');
-      events = JSON.parse(data);
-      console.log(`Database loaded with ${events.length} logs.`);
-    } else {
-      seedDatabase();
-    }
-  } catch (error) {
-    console.error('Failed to load database. Seeding fresh data...', error);
-    seedDatabase();
+// --- Database schema + startup load ---
+async function initSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS events (
+      id TEXT PRIMARY KEY,
+      timestamp TIMESTAMPTZ NOT NULL,
+      ip TEXT NOT NULL,
+      port INTEGER NOT NULL,
+      protocol TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      country TEXT,
+      city TEXT,
+      lat DOUBLE PRECISION,
+      lng DOUBLE PRECISION
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events (timestamp DESC);`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      simulation_speed TEXT NOT NULL,
+      alert_threshold INTEGER NOT NULL,
+      decoy_profile TEXT NOT NULL
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS prowler_metrics (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      total_nsg_checks INTEGER NOT NULL,
+      fails INTEGER NOT NULL,
+      passes INTEGER NOT NULL,
+      updated_at TIMESTAMPTZ
+    );
+  `);
+}
+
+function rowToEvent(row: any): AttackEvent {
+  return {
+    id: row.id,
+    timestamp: new Date(row.timestamp).toISOString(),
+    ip: row.ip,
+    port: row.port,
+    protocol: row.protocol,
+    payload: row.payload,
+    country: row.country,
+    city: row.city,
+    lat: row.lat,
+    lng: row.lng
+  };
+}
+
+async function loadStateFromDb() {
+  const { rows } = await pool.query('SELECT * FROM events ORDER BY timestamp DESC LIMIT 1000');
+  if (rows.length > 0) {
+    events = rows.map(rowToEvent);
+    console.log(`Database loaded with ${events.length} logs.`);
+  } else {
+    await seedDatabase();
+  }
+
+  const settingsResult = await pool.query('SELECT * FROM settings WHERE id = 1');
+  if (settingsResult.rows.length > 0) {
+    const row = settingsResult.rows[0];
+    settings = {
+      simulationSpeed: row.simulation_speed,
+      alertThreshold: row.alert_threshold,
+      decoyProfile: row.decoy_profile
+    };
+  } else {
+    await pool.query(
+      'INSERT INTO settings (id, simulation_speed, alert_threshold, decoy_profile) VALUES (1, $1, $2, $3)',
+      [settings.simulationSpeed, settings.alertThreshold, settings.decoyProfile]
+    );
+  }
+
+  const metricsResult = await pool.query('SELECT * FROM prowler_metrics WHERE id = 1');
+  if (metricsResult.rows.length > 0) {
+    const row = metricsResult.rows[0];
+    latestProwlerMetrics = {
+      total_nsg_checks: row.total_nsg_checks,
+      fails: row.fails,
+      passes: row.passes,
+      updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null
+    };
   }
 }
 
-function saveDatabase() {
-  try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(events, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Failed to write database file:', err);
-  }
-}
-
-function seedDatabase() {
-  events = [];
+async function seedDatabase() {
+  const seeded: AttackEvent[] = [];
   const now = new Date();
-  
+
   // Seed about 80 points scattered across the last 24 hours
   for (let i = 0; i < 80; i++) {
     const hoursAgo = Math.floor(Math.random() * 24);
@@ -118,7 +191,7 @@ function seedDatabase() {
     const ip = SCANNER_IPS[Math.floor(Math.random() * SCANNER_IPS.length)];
     const protoChoices: Array<'SSH' | 'TELNET' | 'HTTP'> = ['SSH', 'TELNET', 'HTTP'];
     const protocol = protoChoices[Math.floor(Math.random() * protoChoices.length)];
-    
+
     let port = 2222;
     if (protocol === 'TELNET') port = 2323;
     if (protocol === 'HTTP') port = 8080;
@@ -126,7 +199,7 @@ function seedDatabase() {
     const payloadList = CREDENTIALS[protocol];
     const payload = payloadList[Math.floor(Math.random() * payloadList.length)];
 
-    events.push({
+    seeded.push({
       id: `seed-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 5)}`,
       timestamp: time.toISOString(),
       ip,
@@ -140,28 +213,47 @@ function seedDatabase() {
     });
   }
 
-  events.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-  saveDatabase();
+  seeded.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+  for (const e of seeded) {
+    await pool.query(
+      `INSERT INTO events (id, timestamp, ip, port, protocol, payload, country, city, lat, lng)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (id) DO NOTHING`,
+      [e.id, e.timestamp, e.ip, e.port, e.protocol, e.payload, e.country, e.city, e.lat, e.lng]
+    );
+  }
+
+  events = seeded;
   console.log('Seeded database with historical honeypot records.');
 }
 
-loadDatabase();
-
-// Adding an Incident and broadcasting
-function insertEvent(eventData: Omit<AttackEvent, 'id' | 'timestamp'>) {
+// Adding an Incident, persisting it, and broadcasting
+async function insertEvent(eventData: Omit<AttackEvent, 'id' | 'timestamp'>): Promise<AttackEvent> {
   const newEvent: AttackEvent = {
     ...eventData,
     id: `evt-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
     timestamp: new Date().toISOString()
   };
 
+  await pool.query(
+    `INSERT INTO events (id, timestamp, ip, port, protocol, payload, country, city, lat, lng)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [newEvent.id, newEvent.timestamp, newEvent.ip, newEvent.port, newEvent.protocol,
+     newEvent.payload, newEvent.country, newEvent.city, newEvent.lat, newEvent.lng]
+  );
+
+  // Keep the table capped at 1000 rows, same as the old file-based behavior.
+  await pool.query(`
+    DELETE FROM events WHERE id NOT IN (
+      SELECT id FROM events ORDER BY timestamp DESC LIMIT 1000
+    )
+  `);
+
   events.unshift(newEvent);
-  // Cap at 1000 events to manage filesystem easily
   if (events.length > 1000) {
     events = events.slice(0, 1000);
   }
-
-  saveDatabase();
 
   // Send SSE push
   sseClients.forEach(client => {
@@ -170,6 +262,41 @@ function insertEvent(eventData: Omit<AttackEvent, 'id' | 'timestamp'>) {
 
   return newEvent;
 }
+
+async function upsertProwlerMetrics(metrics: Omit<ProwlerMetrics, 'updated_at'>): Promise<ProwlerMetrics> {
+  const updated: ProwlerMetrics = { ...metrics, updated_at: new Date().toISOString() };
+
+  await pool.query(
+    `INSERT INTO prowler_metrics (id, total_nsg_checks, fails, passes, updated_at)
+     VALUES (1, $1, $2, $3, $4)
+     ON CONFLICT (id) DO UPDATE SET
+       total_nsg_checks = EXCLUDED.total_nsg_checks,
+       fails = EXCLUDED.fails,
+       passes = EXCLUDED.passes,
+       updated_at = EXCLUDED.updated_at`,
+    [updated.total_nsg_checks, updated.fails, updated.passes, updated.updated_at]
+  );
+
+  latestProwlerMetrics = updated;
+  return updated;
+}
+
+// --- Bearer-token auth for external integrations (Wazuh / Prowler CI) ---
+// This preserves the scheme already committed on main: fails closed (rejects
+// everything) if the corresponding token env var isn't set.
+function requireBearerToken(expectedToken: string) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const authorization = req.headers.authorization;
+
+    if (!expectedToken || authorization !== `Bearer ${expectedToken}`) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    next();
+  };
+}
+const wazuhAuth = requireBearerToken(process.env.WAZUH_WEBHOOK_TOKEN || '');
+const prowlerAuth = requireBearerToken(process.env.PROWLER_WEBHOOK_TOKEN || '');
 
 // --- Active Simulated Security Traffic Generator ---
 let generatorTimer: NodeJS.Timeout | null = null;
@@ -192,7 +319,7 @@ function resetGenerator() {
 
     const protocols: Array<'SSH' | 'TELNET' | 'HTTP'> = ['SSH', 'TELNET', 'HTTP'];
     const protocol = protocols[Math.floor(Math.random() * protocols.length)];
-    
+
     let port = 2222;
     if (protocol === 'TELNET') port = 2323;
     if (protocol === 'HTTP') port = 8080;
@@ -209,138 +336,138 @@ function resetGenerator() {
       city: loc.city,
       lat: loc.lat,
       lng: loc.lng
-    });
+    }).catch(err => console.error('Generator insertEvent failed:', err));
   }, delay);
 }
 
-// Start simulation engine
-resetGenerator();
-
 // --- Real TCP & HTTP Honeypot Socket Pools ---
 // Wrap each listener in try-catch blocks and add 'error' events to prevent any platform port collisions from halting app initialization.
-try {
-  const sshServer = net.createServer((socket) => {
-    const clientIP = socket.remoteAddress?.replace('::ffff:', '') || '127.0.0.1';
-    
-    // Write fake OpenSSH greeting banner
-    socket.write('SSH-2.0-OpenSSH_8.4p1 Ubuntu-5ubuntu1.4\r\n');
-    
-    socket.on('data', (data) => {
-      const payloadStr = data.toString('utf-8', 0, 200).trim().replace(/[\r\n]+/g, ' ');
-      // Resolve geo and write to DB
-      const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-      insertEvent({
-        ip: clientIP,
-        port: 2222,
-        protocol: 'SSH',
-        payload: payloadStr || 'SSH handshake initiated',
-        country: loc.country,
-        city: loc.city,
-        lat: loc.lat,
-        lng: loc.lng
-      });
-      socket.end();
-    });
+function startHoneypotListeners() {
+  try {
+    const sshServer = net.createServer((socket) => {
+      const clientIP = socket.remoteAddress?.replace('::ffff:', '') || '127.0.0.1';
 
-    socket.on('error', () => {});
-  });
+      // Write fake OpenSSH greeting banner
+      socket.write('SSH-2.0-OpenSSH_8.4p1 Ubuntu-5ubuntu1.4\r\n');
 
-  sshServer.on('error', (err: any) => {
-    console.warn(`Decoy SSH Port 2222 error (${err.message}). Running in decoupled simulation mode.`);
-  });
-
-  sshServer.listen(2222, '0.0.0.0', () => {
-    console.log('Decoy SSH Honeypot running internally on port 2222');
-  });
-} catch (e) {
-  console.log('Decoy SSH Port 2222 was already bound or unavailable. Running in decoupled simulation mode.', e);
-}
-
-try {
-  const telnetServer = net.createServer((socket) => {
-    const clientIP = socket.remoteAddress?.replace('::ffff:', '') || '127.0.0.1';
-    socket.write('Ubuntu 22.04.2 LTS\r\nlogin: ');
-
-    let usernameCollected = false;
-    let username = '';
-
-    socket.on('data', (data) => {
-      const input = data.toString('utf-8').trim();
-      if (!usernameCollected) {
-        username = input;
-        usernameCollected = true;
-        socket.write('Password: ');
-      } else {
-        const password = input;
-        socket.write('Login incorrect\r\n');
-        
+      socket.on('data', (data) => {
+        const payloadStr = data.toString('utf-8', 0, 200).trim().replace(/[\r\n]+/g, ' ');
+        // Resolve geo and write to DB
         const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
         insertEvent({
           ip: clientIP,
-          port: 2323,
-          protocol: 'TELNET',
-          payload: `Attempt credentials: ${username} / ${password}`,
+          port: 2222,
+          protocol: 'SSH',
+          payload: payloadStr || 'SSH handshake initiated',
           country: loc.country,
           city: loc.city,
           lat: loc.lat,
           lng: loc.lng
-        });
+        }).catch(err => console.error('SSH insertEvent failed:', err));
         socket.end();
-      }
+      });
+
+      socket.on('error', () => {});
     });
 
-    socket.on('error', () => {});
-  });
+    sshServer.on('error', (err: any) => {
+      console.warn(`Decoy SSH Port 2222 error (${err.message}). Running in decoupled simulation mode.`);
+    });
 
-  telnetServer.on('error', (err: any) => {
-    console.warn(`Decoy Telnet Port 2323 error (${err.message}). Running in decoupled simulation mode.`);
-  });
+    sshServer.listen(2222, '0.0.0.0', () => {
+      console.log('Decoy SSH Honeypot running internally on port 2222');
+    });
+  } catch (e) {
+    console.log('Decoy SSH Port 2222 was already bound or unavailable. Running in decoupled simulation mode.', e);
+  }
 
-  telnetServer.listen(2323, '0.0.0.0', () => {
-    console.log('Decoy Telnet Honeypot running internally on port 2323');
-  });
-} catch (e) {
-  console.log('Decoy Telnet Port 2323 was already bound or unavailable. Running in decoupled simulation mode.', e);
+  try {
+    const telnetServer = net.createServer((socket) => {
+      const clientIP = socket.remoteAddress?.replace('::ffff:', '') || '127.0.0.1';
+      socket.write('Ubuntu 22.04.2 LTS\r\nlogin: ');
+
+      let usernameCollected = false;
+      let username = '';
+
+      socket.on('data', (data) => {
+        // Cap incoming data the same way the SSH listener does, so a single
+        // connection can't push unbounded bytes into the event log.
+        const input = data.toString('utf-8', 0, 200).trim().replace(/[\r\n]+/g, ' ');
+        if (!usernameCollected) {
+          username = input;
+          usernameCollected = true;
+          socket.write('Password: ');
+        } else {
+          const password = input;
+          socket.write('Login incorrect\r\n');
+
+          const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
+          insertEvent({
+            ip: clientIP,
+            port: 2323,
+            protocol: 'TELNET',
+            payload: `Attempt credentials: ${username} / ${password}`,
+            country: loc.country,
+            city: loc.city,
+            lat: loc.lat,
+            lng: loc.lng
+          }).catch(err => console.error('Telnet insertEvent failed:', err));
+          socket.end();
+        }
+      });
+
+      socket.on('error', () => {});
+    });
+
+    telnetServer.on('error', (err: any) => {
+      console.warn(`Decoy Telnet Port 2323 error (${err.message}). Running in decoupled simulation mode.`);
+    });
+
+    telnetServer.listen(2323, '0.0.0.0', () => {
+      console.log('Decoy Telnet Honeypot running internally on port 2323');
+    });
+  } catch (e) {
+    console.log('Decoy Telnet Port 2323 was already bound or unavailable. Running in decoupled simulation mode.', e);
+  }
+
+  try {
+    const httpDecoy = http.createServer((req, res) => {
+      const clientIP = req.socket.remoteAddress?.replace('::ffff:', '') || '127.0.0.1';
+      const reqMethod = req.method || 'GET';
+      const reqPath = req.url || '/';
+      const userAgent = req.headers['user-agent'] || 'Unknown';
+
+      const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
+      insertEvent({
+        ip: clientIP,
+        port: 8080,
+        protocol: 'HTTP',
+        payload: `${reqMethod} ${reqPath} - UA: ${userAgent.slice(0, 80)}`,
+        country: loc.country,
+        city: loc.city,
+        lat: loc.lat,
+        lng: loc.lng
+      }).catch(err => console.error('HTTP decoy insertEvent failed:', err));
+
+      res.writeHead(401, {
+        'Content-Type': 'text/html',
+        'WWW-Authenticate': 'Basic realm="Decoy Admin Workspace Management Console"',
+        'Server': 'Apache/2.4.41 (Ubuntu)'
+      });
+      res.end('<h1>401 Unauthorized</h1><p>Restricted endpoint. Admin credentials needed.</p>');
+    });
+
+    httpDecoy.on('error', (err: any) => {
+      console.warn(`Decoy HTTP Port 8080 error (${err.message}). Running in decoupled simulation mode.`);
+    });
+
+    httpDecoy.listen(8080, '0.0.0.0', () => {
+      console.log('Decoy HTTP Admin Panel running internally on port 8080');
+    });
+  } catch (e) {
+    console.log('Decoy HTTP Port 8080 was already bound or unavailable. Running in decoupled simulation mode.', e);
+  }
 }
-
-try {
-  const httpDecoy = http.createServer((req, res) => {
-    const clientIP = req.socket.remoteAddress?.replace('::ffff:', '') || '127.0.0.1';
-    const reqMethod = req.method || 'GET';
-    const reqPath = req.url || '/';
-    const userAgent = req.headers['user-agent'] || 'Unknown';
-
-    const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-    insertEvent({
-      ip: clientIP,
-      port: 8080,
-      protocol: 'HTTP',
-      payload: `${reqMethod} ${reqPath} - UA: ${userAgent.slice(0, 80)}`,
-      country: loc.country,
-      city: loc.city,
-      lat: loc.lat,
-      lng: loc.lng
-    });
-
-    res.writeHead(401, {
-      'Content-Type': 'text/html',
-      'WWW-Authenticate': 'Basic realm="Decoy Admin Workspace Management Console"',
-      'Server': 'Apache/2.4.41 (Ubuntu)'
-    });
-    res.end('<h1>401 Unauthorized</h1><p>Restricted endpoint. Admin credentials needed.</p>');
-  });
-
-  httpDecoy.on('error', (err: any) => {
-    console.warn(`Decoy HTTP Port 8080 error (${err.message}). Running in decoupled simulation mode.`);
-  });
-
-  httpDecoy.listen(8080, '0.0.0.0', () => {
-    console.log('Decoy HTTP Admin Panel running internally on port 8080');
-  });
-} catch (e) {
-  console.log('Decoy HTTP Port 8080 was already bound or unavailable. Running in decoupled simulation mode.', e);
-}
-
 
 // --- REST API ENDPOINTS ---
 
@@ -487,51 +614,55 @@ app.get('/api/threats', (req, res) => {
 });
 
 // POST /api/simulate - Trigger a client-side simulated direct port hit
-app.post('/api/simulate', (req, res) => {
-  const { protocol, host, payload } = req.body;
-  
-  const selectedProto = (protocol || 'SSH').toUpperCase() as 'SSH' | 'TELNET' | 'HTTP';
-  let port = 2222;
-  if (selectedProto === 'TELNET') port = 2323;
-  if (selectedProto === 'HTTP') port = 8080;
+app.post('/api/simulate', async (req, res) => {
+  try {
+    const { protocol, host, payload } = req.body;
 
-  const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-  const randomizedSuffix = Math.floor(Math.random() * 254 + 1).toString();
-  const sourceIP = host || `198.51.100.${randomizedSuffix}`;
+    const selectedProto = (protocol || 'SSH').toUpperCase() as 'SSH' | 'TELNET' | 'HTTP';
+    let port = 2222;
+    if (selectedProto === 'TELNET') port = 2323;
+    if (selectedProto === 'HTTP') port = 8080;
 
-  const defaultPayloads = CREDENTIALS[selectedProto];
-  const selectedPayload = payload || defaultPayloads[Math.floor(Math.random() * defaultPayloads.length)];
+    const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
+    const randomizedSuffix = Math.floor(Math.random() * 254 + 1).toString();
+    const sourceIP = host || `198.51.100.${randomizedSuffix}`;
 
-  const logged = insertEvent({
-    ip: sourceIP,
-    port,
-    protocol: selectedProto,
-    payload: selectedPayload,
-    country: loc.country,
-    city: loc.city,
-    lat: loc.lat,
-    lng: loc.lng
-  });
+    const defaultPayloads = CREDENTIALS[selectedProto];
+    const selectedPayload = payload || defaultPayloads[Math.floor(Math.random() * defaultPayloads.length)];
 
-  res.json({
-    status: 'success',
-    event: logged
-  });
+    const logged = await insertEvent({
+      ip: sourceIP,
+      port,
+      protocol: selectedProto,
+      payload: selectedPayload,
+      country: loc.country,
+      city: loc.city,
+      lat: loc.lat,
+      lng: loc.lng
+    });
+
+    res.json({
+      status: 'success',
+      event: logged
+    });
+  } catch (err) {
+    console.error('POST /api/simulate failed:', err);
+    res.status(500).json({ error: 'Failed to record simulated event' });
+  }
 });
 
-// POST /api/wazuh/webhook - Ingest Wazuh alerts
-app.post('/api/wazuh/webhook', wazuhAuth, (req, res) => {
-  const alert = req.body;
+// Shared logic for recording a Wazuh-style alert, used by both the protected
+// external webhook and the unauthenticated in-dashboard demo trigger below.
+async function recordWazuhAlert(alert: any) {
   // A typical Wazuh alert has `rule`, `agent`, `location`, `data`
-  
   const ruleId = alert.rule?.id || 'Unknown';
   const description = alert.rule?.description || 'Unknown Alert';
   const ip = alert.data?.srcip || alert.srcip || alert.agent?.ip || 'Unknown IP';
-  
+
   // Try to grab geolocation if Wazuh GeoIP is configured
   const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
 
-  const logged = insertEvent({
+  return insertEvent({
     ip,
     port: 22,
     protocol: 'SSH', // Mocked as SSH for brute force context
@@ -541,50 +672,110 @@ app.post('/api/wazuh/webhook', wazuhAuth, (req, res) => {
     lat: alert.data?.srcgeoip?.location?.lat || loc.lat,
     lng: alert.data?.srcgeoip?.location?.lon || loc.lng
   });
+}
 
-  res.json({
-    status: 'success',
-    event: logged
-  });
+// POST /api/wazuh/webhook - Ingest Wazuh alerts (external integration - API key protected)
+app.post('/api/wazuh/webhook', wazuhAuth, async (req, res) => {
+  try {
+    const logged = await recordWazuhAlert(req.body || {});
+    res.json({
+      status: 'success',
+      event: logged
+    });
+  } catch (err) {
+    console.error('POST /api/wazuh/webhook failed:', err);
+    res.status(500).json({ error: 'Failed to record Wazuh alert' });
+  }
 });
 
-// POST /api/prowler/upload - Ingest Prowler JSON output
-app.post('/api/prowler/upload', prowlerAuth, (req, res) => {
-  const prowlerData = req.body;
-  
+// POST /api/demo/wazuh-alert - Same-origin dashboard demo trigger (NOT for external systems,
+// intentionally not behind wazuhAuth/prowlerAuth so the "Simulate On-Prem Attack" button always works).
+app.post('/api/demo/wazuh-alert', async (req, res) => {
+  try {
+    const logged = await recordWazuhAlert({
+      rule: { id: '5712', description: 'sshd: brute force trying to get access to the system.' },
+      data: { srcip: `198.51.100.${Math.floor(Math.random() * 254 + 1)}` }
+    });
+    res.json({ status: 'success', event: logged });
+  } catch (err) {
+    console.error('POST /api/demo/wazuh-alert failed:', err);
+    res.status(500).json({ error: 'Failed to record demo alert' });
+  }
+});
+
+// Shared logic for turning raw Prowler JSON output into compliance metrics and
+// persisting them, used by both the protected external upload route and the
+// unauthenticated in-dashboard demo trigger below.
+async function processProwlerUpload(prowlerData: unknown) {
   if (!Array.isArray(prowlerData)) {
-    return res.status(400).json({ error: 'Expected an array of Prowler JSON results' });
+    throw Object.assign(new Error('Expected an array of Prowler JSON results'), { statusCode: 400 });
   }
 
   // Handle both standard Prowler V3 format and newer JSON-OCSF formats
-  const nsgChecks = prowlerData.filter((check: any) => 
+  const nsgChecks = prowlerData.filter((check: any) =>
     (check.ServiceName === 'virtualnetwork' && check.ResourceType === 'networksecuritygroups') || // Standard V3 format
     (check.cloud?.service?.name?.toLowerCase() === 'virtualnetwork' && check.cloud?.resource?.type === 'networksecuritygroups') || // Some newer formats
     check.CheckID?.toLowerCase().includes('networksecuritygroup') ||
     (check.resource && check.resource.type === 'Network Security Group')
   );
-  
+
   // Status extraction depends on the specific JSON output format used (V3 vs OCSF)
   let fails = 0;
   let passes = 0;
 
   if (nsgChecks.length > 0) {
-     fails = nsgChecks.filter((check: any) => check.Status === 'FAIL' || check.status === 'Fail' || check.finding_info?.status === 'Fail').length;
-     passes = nsgChecks.filter((check: any) => check.Status === 'PASS' || check.status === 'Pass' || check.finding_info?.status === 'Pass').length;
+    fails = nsgChecks.filter((check: any) => check.Status === 'FAIL' || check.status === 'Fail' || check.finding_info?.status === 'Fail' || check.status_id === 2).length;
+    passes = nsgChecks.filter((check: any) => check.Status === 'PASS' || check.status === 'Pass' || check.finding_info?.status === 'Pass' || check.status_id === 1).length;
   } else {
-     // If no specific NSG checks found, just sum overall passes/fails for the PoC
-     fails = prowlerData.filter((check: any) => check.Status === 'FAIL' || check.status === 'Fail' || check.finding_info?.status === 'Fail' || check.status_id === 2).length;
-     passes = prowlerData.filter((check: any) => check.Status === 'PASS' || check.status === 'Pass' || check.finding_info?.status === 'Pass' || check.status_id === 1).length;
+    // If no specific NSG checks found, just sum overall passes/fails for the PoC
+    fails = prowlerData.filter((check: any) => check.Status === 'FAIL' || check.status === 'Fail' || check.finding_info?.status === 'Fail' || check.status_id === 2).length;
+    passes = prowlerData.filter((check: any) => check.Status === 'PASS' || check.status === 'Pass' || check.finding_info?.status === 'Pass' || check.status_id === 1).length;
   }
 
-  res.json({
-    status: 'success',
-    metrics: {
-      total_nsg_checks: nsgChecks.length > 0 ? nsgChecks.length : prowlerData.length,
-      fails,
-      passes
-    }
+  return upsertProwlerMetrics({
+    total_nsg_checks: nsgChecks.length > 0 ? nsgChecks.length : prowlerData.length,
+    fails,
+    passes
   });
+}
+
+// POST /api/prowler/upload - Ingest Prowler JSON output (external integration - API key protected)
+app.post('/api/prowler/upload', prowlerAuth, async (req, res) => {
+  try {
+    const metrics = await processProwlerUpload(req.body);
+    res.json({ status: 'success', metrics });
+  } catch (err: any) {
+    if (err.statusCode === 400) {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error('POST /api/prowler/upload failed:', err);
+    res.status(500).json({ error: 'Failed to record Prowler results' });
+  }
+});
+
+// POST /api/demo/prowler-scan - Same-origin dashboard demo trigger (NOT for external systems,
+// intentionally not behind wazuhAuth/prowlerAuth so the "Simulate Cloud Misconfiguration" button always works).
+app.post('/api/demo/prowler-scan', async (req, res) => {
+  try {
+    const metrics = await processProwlerUpload([
+      {
+        ServiceName: 'virtualnetwork',
+        ResourceType: 'networksecuritygroups',
+        Status: 'FAIL',
+        Severity: 'Critical',
+        CheckTitle: 'Ensure SSH is restricted from the internet'
+      }
+    ]);
+    res.json({ status: 'success', metrics });
+  } catch (err) {
+    console.error('POST /api/demo/prowler-scan failed:', err);
+    res.status(500).json({ error: 'Failed to record demo scan' });
+  }
+});
+
+// GET /api/prowler/metrics - Latest persisted Prowler compliance metrics
+app.get('/api/prowler/metrics', (req, res) => {
+  res.json(latestProwlerMetrics);
 });
 
 // GET /api/settings - Get settings
@@ -593,17 +784,32 @@ app.get('/api/settings', (req, res) => {
 });
 
 // POST /api/settings - Configure active sandbox speeds and threshold parameters
-app.post('/api/settings', (req, res) => {
-  const { simulationSpeed, alertThreshold, decoyProfile } = req.body;
-  if (simulationSpeed) settings.simulationSpeed = simulationSpeed;
-  if (alertThreshold !== undefined) settings.alertThreshold = Number(alertThreshold);
-  if (decoyProfile) settings.decoyProfile = decoyProfile;
+app.post('/api/settings', async (req, res) => {
+  try {
+    const { simulationSpeed, alertThreshold, decoyProfile } = req.body;
+    if (simulationSpeed) settings.simulationSpeed = simulationSpeed;
+    if (alertThreshold !== undefined) settings.alertThreshold = Number(alertThreshold);
+    if (decoyProfile) settings.decoyProfile = decoyProfile;
 
-  resetGenerator();
-  res.json({
-    status: 'success',
-    settings
-  });
+    await pool.query(
+      `INSERT INTO settings (id, simulation_speed, alert_threshold, decoy_profile)
+       VALUES (1, $1, $2, $3)
+       ON CONFLICT (id) DO UPDATE SET
+         simulation_speed = EXCLUDED.simulation_speed,
+         alert_threshold = EXCLUDED.alert_threshold,
+         decoy_profile = EXCLUDED.decoy_profile`,
+      [settings.simulationSpeed, settings.alertThreshold, settings.decoyProfile]
+    );
+
+    resetGenerator();
+    res.json({
+      status: 'success',
+      settings
+    });
+  } catch (err) {
+    console.error('POST /api/settings failed:', err);
+    res.status(500).json({ error: 'Failed to update settings' });
+  }
 });
 
 // --- VITE INTERFACE INTEGRATION MIDDLEWARES ---
@@ -622,9 +828,21 @@ async function startWebPipeline() {
     });
   }
 
-  app.listen(3000, '0.0.0.0', () => {
-    console.log(`Honeypot Core Server listening on http://0.0.0.0:3000`);
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Honeypot Core Server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-startWebPipeline();
+// --- Bootstrap ---
+async function main() {
+  await initSchema();
+  await loadStateFromDb();
+  resetGenerator();
+  startHoneypotListeners();
+  await startWebPipeline();
+}
+
+main().catch((err) => {
+  console.error('Fatal startup error:', err);
+  process.exit(1);
+});
