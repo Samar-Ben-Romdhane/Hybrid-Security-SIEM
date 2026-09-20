@@ -711,25 +711,45 @@ async function processProwlerUpload(prowlerData: unknown) {
     throw Object.assign(new Error('Expected an array of Prowler JSON results'), { statusCode: 400 });
   }
 
-  // Handle both standard Prowler V3 format and newer JSON-OCSF formats
-  const nsgChecks = prowlerData.filter((check: any) =>
-    (check.ServiceName === 'virtualnetwork' && check.ResourceType === 'networksecuritygroups') || // Standard V3 format
-    (check.cloud?.service?.name?.toLowerCase() === 'virtualnetwork' && check.cloud?.resource?.type === 'networksecuritygroups') || // Some newer formats
-    check.CheckID?.toLowerCase().includes('networksecuritygroup') ||
-    (check.resource && check.resource.type === 'Network Security Group')
-  );
+  // Handle the legacy Prowler V3 native JSON format and the current OCSF v1.1.0
+  // format (default output since Prowler v4). Field mapping per Prowler's own
+  // v3 -> OCSF migration table:
+  //   CheckID -> metadata.event_code | ServiceName -> resources[].group.name
+  //   ResourceType -> resources[].type | Status -> status_code
+  const isNsgCheck = (check: any): boolean => {
+    // Legacy V3 native JSON
+    if (check.ServiceName === 'virtualnetwork' && check.ResourceType === 'networksecuritygroups') return true;
+    if (typeof check.CheckID === 'string' && check.CheckID.toLowerCase().includes('security_group')) return true;
+
+    // Current OCSF v1.1.0 (default since Prowler v4/v5)
+    const eventCode: string = check.metadata?.event_code || '';
+    if (eventCode.toLowerCase().includes('security_group')) return true;
+
+    const resources: any[] = Array.isArray(check.resources) ? check.resources : [];
+    return resources.some((r) =>
+      r?.group?.name?.toLowerCase?.().includes('network') ||
+      r?.type?.toLowerCase?.().includes('networksecuritygroup')
+    );
+  };
+
+  const isFail = (check: any): boolean =>
+    check.Status === 'FAIL' || check.status === 'Fail' || check.status_code === 'FAIL' || check.finding_info?.status === 'Fail';
+  const isPass = (check: any): boolean =>
+    check.Status === 'PASS' || check.status === 'Pass' || check.status_code === 'PASS' || check.finding_info?.status === 'Pass';
+
+  const nsgChecks = prowlerData.filter(isNsgCheck);
 
   // Status extraction depends on the specific JSON output format used (V3 vs OCSF)
   let fails = 0;
   let passes = 0;
 
   if (nsgChecks.length > 0) {
-    fails = nsgChecks.filter((check: any) => check.Status === 'FAIL' || check.status === 'Fail' || check.finding_info?.status === 'Fail' || check.status_id === 2).length;
-    passes = nsgChecks.filter((check: any) => check.Status === 'PASS' || check.status === 'Pass' || check.finding_info?.status === 'Pass' || check.status_id === 1).length;
+    fails = nsgChecks.filter(isFail).length;
+    passes = nsgChecks.filter(isPass).length;
   } else {
     // If no specific NSG checks found, just sum overall passes/fails for the PoC
-    fails = prowlerData.filter((check: any) => check.Status === 'FAIL' || check.status === 'Fail' || check.finding_info?.status === 'Fail' || check.status_id === 2).length;
-    passes = prowlerData.filter((check: any) => check.Status === 'PASS' || check.status === 'Pass' || check.finding_info?.status === 'Pass' || check.status_id === 1).length;
+    fails = prowlerData.filter(isFail).length;
+    passes = prowlerData.filter(isPass).length;
   }
 
   return upsertProwlerMetrics({
