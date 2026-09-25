@@ -16,6 +16,14 @@ FROM node:20-alpine AS production
 WORKDIR /app
 ENV NODE_ENV=production
 
+# Python + Prowler CLI, used by POST /api/prowler/scan to run real on-demand
+# Azure scans (via an Azure Service Principal - see .env.example).
+RUN apk add --no-cache python3 py3-pip && \
+    python3 -m venv /opt/prowler-venv && \
+    /opt/prowler-venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /opt/prowler-venv/bin/pip install --no-cache-dir prowler
+ENV PROWLER_BIN=/opt/prowler-venv/bin/prowler
+
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 

@@ -49,6 +49,9 @@ export default function App() {
   const [sseStatus, setSseStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
   const [selectedEvent, setSelectedEvent] = useState<AttackEvent | null>(null);
   const [simulationStatus, setSimulationStatus] = useState<string | null>(null);
+  const [cloudScanStatus, setCloudScanStatus] = useState<'idle' | 'running' | 'done' | 'failed'>('idle');
+  const [cloudScanError, setCloudScanError] = useState<string | null>(null);
+  const cloudScanPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [timeStr, setTimeStr] = useState<string>(new Date().toISOString());
 
   // Floating Warning Alerts Queue
@@ -390,22 +393,55 @@ export default function App() {
     setTimeout(() => setSimulationStatus(null), 3000);
   };
 
-  // Trigger a same-origin demo Prowler scan (unauthenticated /api/demo/* route -
-  // the real /api/prowler/upload stays protected by the ingestion API key)
+  // Trigger a real Prowler scan against Azure (Service Principal auth) and
+  // poll until it finishes, since a real scan takes a couple of minutes.
   const handleSimulateCloud = async () => {
-    setSimulationStatus('queueing');
+    setCloudScanError(null);
     try {
-      const res = await fetch('/api/demo/prowler-scan', { method: 'POST' });
-      setSimulationStatus(res.ok ? 'compromised' : 'failed');
-      if (res.ok) {
-        await fetchProwlerMetrics();
+      const res = await fetch('/api/prowler/scan', { method: 'POST' });
+      const body = await res.json();
+
+      if (!res.ok) {
+        setCloudScanStatus('failed');
+        setCloudScanError(body.error || 'Failed to start scan');
+        return;
       }
+
+      setCloudScanStatus('running');
+
+      if (cloudScanPollRef.current) clearInterval(cloudScanPollRef.current);
+      cloudScanPollRef.current = setInterval(async () => {
+        try {
+          const statusRes = await fetch('/api/prowler/scan-status');
+          const state = await statusRes.json();
+
+          if (state.status === 'done') {
+            clearInterval(cloudScanPollRef.current!);
+            setCloudScanStatus('done');
+            await fetchProwlerMetrics();
+            setTimeout(() => setCloudScanStatus('idle'), 5000);
+          } else if (state.status === 'failed') {
+            clearInterval(cloudScanPollRef.current!);
+            setCloudScanStatus('failed');
+            setCloudScanError(state.error || 'Scan failed');
+          }
+        } catch (err) {
+          console.error('Error polling scan status:', err);
+        }
+      }, 4000);
     } catch (err) {
       console.error(err);
-      setSimulationStatus('failed');
+      setCloudScanStatus('failed');
+      setCloudScanError('Could not reach the server');
     }
-    setTimeout(() => setSimulationStatus(null), 3000);
   };
+
+  // Stop polling if the component unmounts mid-scan
+  useEffect(() => {
+    return () => {
+      if (cloudScanPollRef.current) clearInterval(cloudScanPollRef.current);
+    };
+  }, []);
 
   // Configure settings overrides
   const handleUpdateSettings = async (override: Partial<SystemSettings>) => {
@@ -582,6 +618,8 @@ export default function App() {
         {activeTab === 'simulator' && (
           <SimulatorPanel
             simulationStatus={simulationStatus}
+            cloudScanStatus={cloudScanStatus}
+            cloudScanError={cloudScanError}
             onSimulateOnPrem={handleSimulateOnPrem}
             onSimulateCloud={handleSimulateCloud}
           />

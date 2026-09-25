@@ -1,0 +1,319 @@
+diff --git a/.env.example b/.env.example
+index d10225a..a74b8dc 100644
+--- a/.env.example
++++ b/.env.example
+@@ -23,6 +23,19 @@ POSTGRES_PASSWORD="change-me-to-a-real-password"
+ # Azure Maps geolocation endpoint integration key (Optional if Leaflet is standard)
+ AZURE_MAPS_KEY="YOUR_AZURE_MAPS_SUBSCRIPTION_KEY"
+ 
++# --- Azure Service Principal, used by the real on-demand Prowler scan ---
++# Triggered from the dashboard's "Simulate Cloud Misconfiguration" button via
++# POST /api/prowler/scan. Interactive az-cli/browser login isn't available from
++# a server-side button click, so a Service Principal is required for this.
++# Create one (Reader is enough for Prowler's read-only checks):
++#   az ad sp create-for-rbac --name hybrid-siem-prowler --role Reader \
++#     --scopes /subscriptions/<your-subscription-id>
++# That command prints appId (-> AZURE_CLIENT_ID), password (-> AZURE_CLIENT_SECRET),
++# and tenant (-> AZURE_TENANT_ID).
++AZURE_CLIENT_ID=""
++AZURE_TENANT_ID=""
++AZURE_CLIENT_SECRET=""
++
+ # Bearer tokens required (Authorization: Bearer <token>) to call the external
+ # ingestion endpoints: POST /api/wazuh/webhook and POST /api/prowler/upload.
+ # These endpoints reject every request if their token is not set (fail-closed),
+diff --git a/Dockerfile b/Dockerfile
+index d6c3879..d9fd50f 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -16,6 +16,14 @@ FROM node:20-alpine AS production
+ WORKDIR /app
+ ENV NODE_ENV=production
+ 
++# Python + Prowler CLI, used by POST /api/prowler/scan to run real on-demand
++# Azure scans (via an Azure Service Principal - see .env.example).
++RUN apk add --no-cache python3 py3-pip && \
++    python3 -m venv /opt/prowler-venv && \
++    /opt/prowler-venv/bin/pip install --no-cache-dir --upgrade pip && \
++    /opt/prowler-venv/bin/pip install --no-cache-dir prowler
++ENV PROWLER_BIN=/opt/prowler-venv/bin/prowler
++
+ COPY package.json package-lock.json ./
+ RUN npm ci --omit=dev && npm cache clean --force
+ 
+diff --git a/server.ts b/server.ts
+index 77bc3a2..1374c0a 100644
+--- a/server.ts
++++ b/server.ts
+@@ -1,7 +1,9 @@
+ import express from 'express';
+ import path from 'path';
++import fs from 'fs';
+ import net from 'net';
+ import http from 'http';
++import { spawn } from 'child_process';
+ import { createServer as createViteServer } from 'vite';
+ import dotenv from 'dotenv';
+ import { Pool } from 'pg';
+@@ -798,6 +800,82 @@ app.get('/api/prowler/metrics', (req, res) => {
+   res.json(latestProwlerMetrics);
+ });
+ 
++// --- Real on-demand Prowler scan against the actual Azure environment ---
++// Uses a Service Principal (--sp-env-auth) since interactive az-cli/browser
++// login isn't available from a server-side button click.
++const PROWLER_BIN = process.env.PROWLER_BIN || '/opt/prowler-venv/bin/prowler';
++const PROWLER_SCAN_DIR = '/tmp/prowler-scans';
++
++interface CloudScanState {
++  status: 'idle' | 'running' | 'done' | 'failed';
++  startedAt: string | null;
++  finishedAt: string | null;
++  error: string | null;
++}
++let cloudScanState: CloudScanState = { status: 'idle', startedAt: null, finishedAt: null, error: null };
++
++function findLatestOcsfFile(dir: string): string | null {
++  if (!fs.existsSync(dir)) return null;
++  const files = fs.readdirSync(dir)
++    .filter((f) => f.endsWith('.ocsf.json'))
++    .map((f) => ({ name: f, mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
++    .sort((a, b) => b.mtime - a.mtime);
++  return files.length > 0 ? path.join(dir, files[0].name) : null;
++}
++
++// POST /api/prowler/scan - Kick off a real scan against Azure. Fire-and-forget:
++// responds immediately, the dashboard polls /api/prowler/scan-status for progress.
++app.post('/api/prowler/scan', (req, res) => {
++  if (cloudScanState.status === 'running') {
++    return res.status(409).json({ error: 'A scan is already running', state: cloudScanState });
++  }
++
++  const { AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET } = process.env;
++  if (!AZURE_CLIENT_ID || !AZURE_TENANT_ID || !AZURE_CLIENT_SECRET) {
++    return res.status(400).json({
++      error: 'Azure Service Principal not configured. Set AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_CLIENT_SECRET.'
++    });
++  }
++
++  fs.mkdirSync(PROWLER_SCAN_DIR, { recursive: true });
++  cloudScanState = { status: 'running', startedAt: new Date().toISOString(), finishedAt: null, error: null };
++  res.json({ status: 'started', state: cloudScanState });
++
++  const child = spawn(PROWLER_BIN, ['azure', '--sp-env-auth', '-M', 'json-ocsf', '-o', PROWLER_SCAN_DIR], {
++    env: process.env
++  });
++
++  let output = '';
++  child.stdout.on('data', (chunk) => { output += chunk.toString(); });
++  child.stderr.on('data', (chunk) => { output += chunk.toString(); });
++
++  const finish = async (spawnError?: Error) => {
++    try {
++      const ocsfFile = findLatestOcsfFile(PROWLER_SCAN_DIR);
++      if (ocsfFile) {
++        const parsed = JSON.parse(fs.readFileSync(ocsfFile, 'utf-8'));
++        await processProwlerUpload(parsed);
++        cloudScanState = { status: 'done', startedAt: cloudScanState.startedAt, finishedAt: new Date().toISOString(), error: null };
++      } else {
++        // Strip ANSI color codes and keep only the last part of the output (the actual error)
++        const cleanOutput = output.replace(/\x1b\[[0-9;]*m/g, '').trim();
++        const errorMessage = spawnError?.message || cleanOutput.slice(-800) || 'Scan produced no output file';
++        cloudScanState = { status: 'failed', startedAt: cloudScanState.startedAt, finishedAt: new Date().toISOString(), error: errorMessage };
++      }
++    } catch (err: any) {
++      cloudScanState = { status: 'failed', startedAt: cloudScanState.startedAt, finishedAt: new Date().toISOString(), error: err.message };
++    }
++  };
++
++  child.on('close', () => { finish(); });
++  child.on('error', (err) => { finish(err); });
++});
++
++// GET /api/prowler/scan-status - Poll target for the dashboard while a real scan runs
++app.get('/api/prowler/scan-status', (req, res) => {
++  res.json(cloudScanState);
++});
++
+ // GET /api/settings - Get settings
+ app.get('/api/settings', (req, res) => {
+   res.json(settings);
+diff --git a/src/App.tsx b/src/App.tsx
+index d10312c..09c4be1 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -49,6 +49,9 @@ export default function App() {
+   const [sseStatus, setSseStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
+   const [selectedEvent, setSelectedEvent] = useState<AttackEvent | null>(null);
+   const [simulationStatus, setSimulationStatus] = useState<string | null>(null);
++  const [cloudScanStatus, setCloudScanStatus] = useState<'idle' | 'running' | 'done' | 'failed'>('idle');
++  const [cloudScanError, setCloudScanError] = useState<string | null>(null);
++  const cloudScanPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+   const [timeStr, setTimeStr] = useState<string>(new Date().toISOString());
+ 
+   // Floating Warning Alerts Queue
+@@ -390,23 +393,56 @@ export default function App() {
+     setTimeout(() => setSimulationStatus(null), 3000);
+   };
+ 
+-  // Trigger a same-origin demo Prowler scan (unauthenticated /api/demo/* route -
+-  // the real /api/prowler/upload stays protected by the ingestion API key)
++  // Trigger a real Prowler scan against Azure (Service Principal auth) and
++  // poll until it finishes, since a real scan takes a couple of minutes.
+   const handleSimulateCloud = async () => {
+-    setSimulationStatus('queueing');
++    setCloudScanError(null);
+     try {
+-      const res = await fetch('/api/demo/prowler-scan', { method: 'POST' });
+-      setSimulationStatus(res.ok ? 'compromised' : 'failed');
+-      if (res.ok) {
+-        await fetchProwlerMetrics();
++      const res = await fetch('/api/prowler/scan', { method: 'POST' });
++      const body = await res.json();
++
++      if (!res.ok) {
++        setCloudScanStatus('failed');
++        setCloudScanError(body.error || 'Failed to start scan');
++        return;
+       }
++
++      setCloudScanStatus('running');
++
++      if (cloudScanPollRef.current) clearInterval(cloudScanPollRef.current);
++      cloudScanPollRef.current = setInterval(async () => {
++        try {
++          const statusRes = await fetch('/api/prowler/scan-status');
++          const state = await statusRes.json();
++
++          if (state.status === 'done') {
++            clearInterval(cloudScanPollRef.current!);
++            setCloudScanStatus('done');
++            await fetchProwlerMetrics();
++            setTimeout(() => setCloudScanStatus('idle'), 5000);
++          } else if (state.status === 'failed') {
++            clearInterval(cloudScanPollRef.current!);
++            setCloudScanStatus('failed');
++            setCloudScanError(state.error || 'Scan failed');
++          }
++        } catch (err) {
++          console.error('Error polling scan status:', err);
++        }
++      }, 4000);
+     } catch (err) {
+       console.error(err);
+-      setSimulationStatus('failed');
++      setCloudScanStatus('failed');
++      setCloudScanError('Could not reach the server');
+     }
+-    setTimeout(() => setSimulationStatus(null), 3000);
+   };
+ 
++  // Stop polling if the component unmounts mid-scan
++  useEffect(() => {
++    return () => {
++      if (cloudScanPollRef.current) clearInterval(cloudScanPollRef.current);
++    };
++  }, []);
++
+   // Configure settings overrides
+   const handleUpdateSettings = async (override: Partial<SystemSettings>) => {
+     const nextSettings = { ...settings, ...override };
+@@ -582,6 +618,8 @@ export default function App() {
+         {activeTab === 'simulator' && (
+           <SimulatorPanel
+             simulationStatus={simulationStatus}
++            cloudScanStatus={cloudScanStatus}
++            cloudScanError={cloudScanError}
+             onSimulateOnPrem={handleSimulateOnPrem}
+             onSimulateCloud={handleSimulateCloud}
+           />
+diff --git a/src/components/SimulatorPanel.tsx b/src/components/SimulatorPanel.tsx
+index d3c3377..c9f247f 100644
+--- a/src/components/SimulatorPanel.tsx
++++ b/src/components/SimulatorPanel.tsx
+@@ -1,13 +1,21 @@
+ import React from 'react';
+-import { Zap, Server, Globe, CheckCircle2, AlertCircle, Sliders } from 'lucide-react';
++import { Zap, Server, Globe, CheckCircle2, AlertCircle, Sliders, Loader2 } from 'lucide-react';
+ 
+ interface SimulatorPanelProps {
+   simulationStatus: string | null;
++  cloudScanStatus: 'idle' | 'running' | 'done' | 'failed';
++  cloudScanError: string | null;
+   onSimulateOnPrem: () => void;
+   onSimulateCloud: () => void;
+ }
+ 
+-export default function SimulatorPanel({ simulationStatus, onSimulateOnPrem, onSimulateCloud }: SimulatorPanelProps) {
++export default function SimulatorPanel({
++  simulationStatus,
++  cloudScanStatus,
++  cloudScanError,
++  onSimulateOnPrem,
++  onSimulateCloud
++}: SimulatorPanelProps) {
+   return (
+     <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+ 
+@@ -43,27 +51,33 @@ export default function SimulatorPanel({ simulationStatus, onSimulateOnPrem, onS
+             </button>
+           </div>
+ 
+-          {/* Cloud Simulator */}
++          {/* Cloud Simulator - triggers a REAL Prowler scan against Azure via a Service Principal */}
+           <div className="bg-slate-950 p-4 border border-slate-800 rounded-lg flex flex-col gap-3">
+             <div className="flex items-center gap-2 mb-2">
+               <Globe size={14} className="text-cyan-400" />
+               <span className="text-[10px] uppercase font-bold tracking-widest text-slate-300">Azure Cloud Tenant</span>
+             </div>
+             <p className="text-[9px] text-slate-500 uppercase leading-relaxed mb-2">
+-              Trigger a mock Prowler compliance failure by exposing an NSG rule on port 3389 to 0.0.0.0/0.
++              Runs a real Prowler scan against your Azure subscription (Service Principal auth). Takes a couple of minutes.
+             </p>
+             <button
+               type="button"
+-              disabled={simulationStatus === 'queueing'}
++              disabled={cloudScanStatus === 'running'}
+               onClick={onSimulateCloud}
+-              className="w-full py-2.5 bg-cyan-900/40 hover:bg-cyan-900/60 disabled:bg-slate-800 disabled:text-slate-550 border border-cyan-900/50 text-cyan-400 font-bold uppercase tracking-widest text-[9px] rounded-lg transition"
++              className="w-full py-2.5 bg-cyan-900/40 hover:bg-cyan-900/60 disabled:bg-slate-800 disabled:text-slate-550 border border-cyan-900/50 text-cyan-400 font-bold uppercase tracking-widest text-[9px] rounded-lg transition flex items-center justify-center gap-2"
+             >
+-              {simulationStatus === 'queueing' ? 'INJECTING...' : 'Simulate Cloud Misconfiguration'}
++              {cloudScanStatus === 'running' ? (
++                <>
++                  <Loader2 size={12} className="animate-spin" /> SCANNING AZURE...
++                </>
++              ) : (
++                'Run Real Prowler Scan'
++              )}
+             </button>
+           </div>
+         </div>
+ 
+-        <div className="mt-4">
++        <div className="mt-4 space-y-2">
+           {simulationStatus === 'compromised' && (
+             <div className="border border-emerald-500/30 bg-emerald-950/20 text-emerald-400 p-3 rounded-lg flex items-center gap-2.5">
+               <CheckCircle2 size={13} className="text-emerald-400" />
+@@ -76,6 +90,21 @@ export default function SimulatorPanel({ simulationStatus, onSimulateOnPrem, onS
+               <span className="font-extrabold uppercase text-[9px] tracking-wider">INJECTION ERROR: Port stream transmission crashed.</span>
+             </div>
+           )}
++          {cloudScanStatus === 'done' && (
++            <div className="border border-emerald-500/30 bg-emerald-950/20 text-emerald-400 p-3 rounded-lg flex items-center gap-2.5">
++              <CheckCircle2 size={13} className="text-emerald-400" />
++              <span className="font-extrabold uppercase text-[9px] tracking-wider">SCAN COMPLETE: Real Azure compliance data updated!</span>
++            </div>
++          )}
++          {cloudScanStatus === 'failed' && (
++            <div className="border border-red-500/30 bg-red-950/20 text-red-400 p-3 rounded-lg flex items-start gap-2.5">
++              <AlertCircle size={13} className="text-red-400 flex-shrink-0 mt-0.5" />
++              <div>
++                <div className="font-extrabold uppercase text-[9px] tracking-wider mb-1">SCAN FAILED</div>
++                <div className="text-[9px] text-red-300/80 font-mono break-words max-w-md">{cloudScanError}</div>
++              </div>
++            </div>
++          )}
+         </div>
+       </div>
+ 

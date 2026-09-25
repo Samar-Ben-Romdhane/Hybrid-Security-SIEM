@@ -1,7 +1,9 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
 import net from 'net';
 import http from 'http';
+import { spawn } from 'child_process';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
@@ -796,6 +798,82 @@ app.post('/api/demo/prowler-scan', async (req, res) => {
 // GET /api/prowler/metrics - Latest persisted Prowler compliance metrics
 app.get('/api/prowler/metrics', (req, res) => {
   res.json(latestProwlerMetrics);
+});
+
+// --- Real on-demand Prowler scan against the actual Azure environment ---
+// Uses a Service Principal (--sp-env-auth) since interactive az-cli/browser
+// login isn't available from a server-side button click.
+const PROWLER_BIN = process.env.PROWLER_BIN || '/opt/prowler-venv/bin/prowler';
+const PROWLER_SCAN_DIR = '/tmp/prowler-scans';
+
+interface CloudScanState {
+  status: 'idle' | 'running' | 'done' | 'failed';
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+}
+let cloudScanState: CloudScanState = { status: 'idle', startedAt: null, finishedAt: null, error: null };
+
+function findLatestOcsfFile(dir: string): string | null {
+  if (!fs.existsSync(dir)) return null;
+  const files = fs.readdirSync(dir)
+    .filter((f) => f.endsWith('.ocsf.json'))
+    .map((f) => ({ name: f, mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime);
+  return files.length > 0 ? path.join(dir, files[0].name) : null;
+}
+
+// POST /api/prowler/scan - Kick off a real scan against Azure. Fire-and-forget:
+// responds immediately, the dashboard polls /api/prowler/scan-status for progress.
+app.post('/api/prowler/scan', (req, res) => {
+  if (cloudScanState.status === 'running') {
+    return res.status(409).json({ error: 'A scan is already running', state: cloudScanState });
+  }
+
+  const { AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET } = process.env;
+  if (!AZURE_CLIENT_ID || !AZURE_TENANT_ID || !AZURE_CLIENT_SECRET) {
+    return res.status(400).json({
+      error: 'Azure Service Principal not configured. Set AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_CLIENT_SECRET.'
+    });
+  }
+
+  fs.mkdirSync(PROWLER_SCAN_DIR, { recursive: true });
+  cloudScanState = { status: 'running', startedAt: new Date().toISOString(), finishedAt: null, error: null };
+  res.json({ status: 'started', state: cloudScanState });
+
+  const child = spawn(PROWLER_BIN, ['azure', '--sp-env-auth', '-M', 'json-ocsf', '-o', PROWLER_SCAN_DIR], {
+    env: process.env
+  });
+
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk.toString(); });
+  child.stderr.on('data', (chunk) => { output += chunk.toString(); });
+
+  const finish = async (spawnError?: Error) => {
+    try {
+      const ocsfFile = findLatestOcsfFile(PROWLER_SCAN_DIR);
+      if (ocsfFile) {
+        const parsed = JSON.parse(fs.readFileSync(ocsfFile, 'utf-8'));
+        await processProwlerUpload(parsed);
+        cloudScanState = { status: 'done', startedAt: cloudScanState.startedAt, finishedAt: new Date().toISOString(), error: null };
+      } else {
+        // Strip ANSI color codes and keep only the last part of the output (the actual error)
+        const cleanOutput = output.replace(/\x1b\[[0-9;]*m/g, '').trim();
+        const errorMessage = spawnError?.message || cleanOutput.slice(-800) || 'Scan produced no output file';
+        cloudScanState = { status: 'failed', startedAt: cloudScanState.startedAt, finishedAt: new Date().toISOString(), error: errorMessage };
+      }
+    } catch (err: any) {
+      cloudScanState = { status: 'failed', startedAt: cloudScanState.startedAt, finishedAt: new Date().toISOString(), error: err.message };
+    }
+  };
+
+  child.on('close', () => { finish(); });
+  child.on('error', (err) => { finish(err); });
+});
+
+// GET /api/prowler/scan-status - Poll target for the dashboard while a real scan runs
+app.get('/api/prowler/scan-status', (req, res) => {
+  res.json(cloudScanState);
 });
 
 // GET /api/settings - Get settings
