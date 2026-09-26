@@ -25,7 +25,10 @@ export default function App() {
     top_port: '2222',
     protocol_stats: { SSH: 0, TELNET: 0, HTTP: 0 },
     top_attackers: [],
-    top_payloads: []
+    top_payloads: [],
+    source_breakdown: {},
+    wazuh_alerts_last_hour: 0,
+    hourly_timeline: []
   });
   const [threatActors, setThreatActors] = useState<ThreatActor[]>([]);
   const [settings, setSettings] = useState<SystemSettings>({
@@ -275,15 +278,23 @@ export default function App() {
           return clipped;
         });
 
-        // Recalculate metrics incrementally without hammering the database
+        // Recalculate metrics incrementally without hammering the database.
+        // (Corrected periodically by the resync interval below, since the
+        // server caps stored events at 1000 - this optimistic count alone
+        // would otherwise drift upward forever with no ceiling.)
         setStats((prev) => {
           const updatedProto = { ...prev.protocol_stats };
           updatedProto[newEvent.protocol] = (updatedProto[newEvent.protocol] || 0) + 1;
 
+          const updatedSource = { ...prev.source_breakdown };
+          const src = newEvent.source || 'generator';
+          updatedSource[src] = (updatedSource[src] || 0) + 1;
+
           return {
             ...prev,
             total_attacks: prev.total_attacks + 1,
-            protocol_stats: updatedProto
+            protocol_stats: updatedProto,
+            source_breakdown: updatedSource
           };
         });
 
@@ -338,8 +349,14 @@ export default function App() {
     syncTelemetry();
     queryLogs(1, 'ALL');
 
+    // The SSE handler above increments counters optimistically for instant
+    // feedback, but has no ceiling - periodically pull the server's real,
+    // capped numbers to correct any drift automatically.
+    const resyncTimer = setInterval(syncTelemetry, 15000);
+
     return () => {
       es.close();
+      clearInterval(resyncTimer);
     };
   }, [settings.alertThreshold]);
 
@@ -496,15 +513,8 @@ export default function App() {
     Attempts: item.count
   }));
 
-  // 3. Generate mock hourly timeline distribution chart for styling excellence
-  const timelineChartData = [
-    { hour: '04:00', Events: Math.floor(events.length * 0.1) || 8 },
-    { hour: '08:00', Events: Math.floor(events.length * 0.15) || 12 },
-    { hour: '12:00', Events: Math.floor(events.length * 0.25) || 20 },
-    { hour: '16:00', Events: Math.floor(events.length * 0.3) || 28 },
-    { hour: '20:00', Events: Math.floor(events.length * 0.45) || 38 },
-    { hour: '00:00', Events: Math.floor(events.length * 0.5) || 45 }
-  ];
+  // 3. Real hourly traffic density, computed server-side from actual event timestamps
+  const timelineChartData = stats.hourly_timeline.map((b) => ({ hour: b.hour, Events: b.events }));
 
   // Paginated log change triggers
   const handleLogPageChange = (direction: 'next' | 'prev') => {

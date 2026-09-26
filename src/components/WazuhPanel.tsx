@@ -8,6 +8,11 @@ interface WazuhPanelProps {
 }
 
 export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
+  // This panel is specifically labeled WAZUH - only show events that actually
+  // came from a real forwarded Wazuh alert, not the synthetic generator,
+  // decoy captures, or demo-button clicks.
+  const wazuhEvents = events.filter((e) => e.source === 'wazuh');
+
   return (
     <div className="bg-slate-900/20 border border-slate-800 rounded-xl overflow-hidden relative flex flex-col h-[520px] shadow-sm">
       <div className="bg-slate-950 border-b border-slate-800 p-3 flex justify-between items-center z-10">
@@ -35,11 +40,11 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
         <h3 className="text-[10px] font-bold uppercase text-slate-500 mb-3 border-b border-slate-800 pb-1">Recent Alerts</h3>
 
         <div className="flex flex-col gap-2">
-          {events.slice(0, 10).map((evt, idx) => (
+          {wazuhEvents.slice(0, 10).map((evt, idx) => (
             <div key={idx} className="bg-slate-900/40 border border-slate-800 rounded-lg p-2.5 flex flex-col gap-1.5 hover:bg-slate-800/40 transition">
-              <div className="flex justify-between items-start">
-                <span className="text-red-400 text-[10px] font-bold">[Rule 5712] SSH Brute Force Attempt</span>
-                <span className="text-[8px] text-slate-500">{new Date(evt.timestamp).toLocaleTimeString()}</span>
+              <div className="flex justify-between items-start gap-2">
+                <span className="text-red-400 text-[10px] font-bold">{evt.payload}</span>
+                <span className="text-[8px] text-slate-500 flex-shrink-0">{new Date(evt.timestamp).toLocaleTimeString()}</span>
               </div>
               <div className="flex justify-between text-[9px] text-slate-400">
                 <span>Src: <span className="text-slate-200">{evt.ip}</span></span>
@@ -47,8 +52,8 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
               </div>
             </div>
           ))}
-          {events.length === 0 && (
-            <div className="text-slate-600 text-[10px] py-8 text-center italic">No active Wazuh alerts on premises.</div>
+          {wazuhEvents.length === 0 && (
+            <div className="text-slate-600 text-[10px] py-8 text-center italic">No real Wazuh alerts forwarded yet.</div>
           )}
         </div>
       </div>

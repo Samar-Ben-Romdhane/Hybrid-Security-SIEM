@@ -7,7 +7,7 @@ import { spawn } from 'child_process';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
-import { AttackEvent, SystemSettings } from './src/types';
+import { AttackEvent, AttackSource, SystemSettings } from './src/types';
 
 dotenv.config();
 
@@ -105,9 +105,12 @@ async function initSchema() {
       country TEXT,
       city TEXT,
       lat DOUBLE PRECISION,
-      lng DOUBLE PRECISION
+      lng DOUBLE PRECISION,
+      source TEXT NOT NULL DEFAULT 'generator'
     );
   `);
+  // Migration for tables created before the source column existed.
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'generator';`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events (timestamp DESC);`);
 
   await pool.query(`
@@ -141,7 +144,8 @@ function rowToEvent(row: any): AttackEvent {
     country: row.country,
     city: row.city,
     lat: row.lat,
-    lng: row.lng
+    lng: row.lng,
+    source: row.source || 'generator'
   };
 }
 
@@ -208,6 +212,7 @@ async function seedDatabase() {
       port,
       protocol,
       payload,
+      source: 'generator',
       country: loc.country,
       city: loc.city,
       lat: loc.lat,
@@ -239,10 +244,10 @@ async function insertEvent(eventData: Omit<AttackEvent, 'id' | 'timestamp'>): Pr
   };
 
   await pool.query(
-    `INSERT INTO events (id, timestamp, ip, port, protocol, payload, country, city, lat, lng)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    `INSERT INTO events (id, timestamp, ip, port, protocol, payload, country, city, lat, lng, source)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
     [newEvent.id, newEvent.timestamp, newEvent.ip, newEvent.port, newEvent.protocol,
-     newEvent.payload, newEvent.country, newEvent.city, newEvent.lat, newEvent.lng]
+     newEvent.payload, newEvent.country, newEvent.city, newEvent.lat, newEvent.lng, newEvent.source]
   );
 
   // Keep the table capped at 1000 rows, same as the old file-based behavior.
@@ -337,7 +342,8 @@ function resetGenerator() {
       country: loc.country,
       city: loc.city,
       lat: loc.lat,
-      lng: loc.lng
+      lng: loc.lng,
+      source: 'generator'
     }).catch(err => console.error('Generator insertEvent failed:', err));
   }, delay);
 }
@@ -364,7 +370,8 @@ function startHoneypotListeners() {
           country: loc.country,
           city: loc.city,
           lat: loc.lat,
-          lng: loc.lng
+          lng: loc.lng,
+          source: 'decoy'
         }).catch(err => console.error('SSH insertEvent failed:', err));
         socket.end();
       });
@@ -412,7 +419,8 @@ function startHoneypotListeners() {
             country: loc.country,
             city: loc.city,
             lat: loc.lat,
-            lng: loc.lng
+            lng: loc.lng,
+            source: 'decoy'
           }).catch(err => console.error('Telnet insertEvent failed:', err));
           socket.end();
         }
@@ -448,7 +456,8 @@ function startHoneypotListeners() {
         country: loc.country,
         city: loc.city,
         lat: loc.lat,
-        lng: loc.lng
+        lng: loc.lng,
+        source: 'decoy'
       }).catch(err => console.error('HTTP decoy insertEvent failed:', err));
 
       res.writeHead(401, {
@@ -520,6 +529,20 @@ app.get('/api/events', (req, res) => {
 app.get('/api/stats', (req, res) => {
   const total_attacks = events.length;
 
+  // Breakdown by where each event actually came from - this is what lets the
+  // "Wazuh Active Alerts" tile show a real, honest count instead of lumping
+  // in the synthetic generator, decoy captures, and demo-button clicks.
+  const source_breakdown: Record<string, number> = {};
+  events.forEach(e => {
+    const src = e.source || 'generator';
+    source_breakdown[src] = (source_breakdown[src] || 0) + 1;
+  });
+
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  const wazuh_alerts_last_hour = events.filter(
+    e => e.source === 'wazuh' && new Date(e.timestamp).getTime() >= oneHourAgo
+  ).length;
+
   // Unique IPs
   const uniqueIPsSet = new Set(events.map(e => e.ip));
   const unique_ips = uniqueIPsSet.size;
@@ -571,13 +594,36 @@ app.get('/api/stats', (req, res) => {
     .sort((a, b) => b.count - a.count)
     .slice(0, 10);
 
+  // Real traffic density over the last 24 hours, bucketed into 6 four-hour
+  // windows, computed from actual event timestamps (not an approximation).
+  const BUCKET_MS = 4 * 60 * 60 * 1000;
+  const BUCKET_COUNT = 6;
+  const nowMs = Date.now();
+  const buckets = Array.from({ length: BUCKET_COUNT }, (_, i) => {
+    const bucketEnd = nowMs - (BUCKET_COUNT - 1 - i) * BUCKET_MS;
+    return {
+      end: bucketEnd,
+      label: new Date(bucketEnd).toTimeString().slice(0, 5),
+      count: 0
+    };
+  });
+  events.forEach((e) => {
+    const t = new Date(e.timestamp).getTime();
+    const bucket = buckets.find((b) => t <= b.end && t > b.end - BUCKET_MS);
+    if (bucket) bucket.count += 1;
+  });
+  const hourly_timeline = buckets.map((b) => ({ hour: b.label, events: b.count }));
+
   res.json({
     total_attacks,
     unique_ips,
     top_port,
     protocol_stats,
     top_attackers,
-    top_payloads
+    top_payloads,
+    source_breakdown,
+    wazuh_alerts_last_hour,
+    hourly_timeline
   });
 });
 
@@ -640,7 +686,8 @@ app.post('/api/simulate', async (req, res) => {
       country: loc.country,
       city: loc.city,
       lat: loc.lat,
-      lng: loc.lng
+      lng: loc.lng,
+      source: 'manual'
     });
 
     res.json({
@@ -655,7 +702,7 @@ app.post('/api/simulate', async (req, res) => {
 
 // Shared logic for recording a Wazuh-style alert, used by both the protected
 // external webhook and the unauthenticated in-dashboard demo trigger below.
-async function recordWazuhAlert(alert: any) {
+async function recordWazuhAlert(alert: any, source: AttackSource) {
   // A typical Wazuh alert has `rule`, `agent`, `location`, `data`
   const ruleId = alert.rule?.id || 'Unknown';
   const description = alert.rule?.description || 'Unknown Alert';
@@ -672,14 +719,15 @@ async function recordWazuhAlert(alert: any) {
     country: alert.data?.srcgeoip?.country_name || loc.country,
     city: alert.data?.srcgeoip?.city_name || loc.city,
     lat: alert.data?.srcgeoip?.location?.lat || loc.lat,
-    lng: alert.data?.srcgeoip?.location?.lon || loc.lng
+    lng: alert.data?.srcgeoip?.location?.lon || loc.lng,
+    source
   });
 }
 
 // POST /api/wazuh/webhook - Ingest Wazuh alerts (external integration - API key protected)
 app.post('/api/wazuh/webhook', wazuhAuth, async (req, res) => {
   try {
-    const logged = await recordWazuhAlert(req.body || {});
+    const logged = await recordWazuhAlert(req.body || {}, 'wazuh');
     res.json({
       status: 'success',
       event: logged
@@ -697,7 +745,7 @@ app.post('/api/demo/wazuh-alert', async (req, res) => {
     const logged = await recordWazuhAlert({
       rule: { id: '5712', description: 'sshd: brute force trying to get access to the system.' },
       data: { srcip: `198.51.100.${Math.floor(Math.random() * 254 + 1)}` }
-    });
+    }, 'demo');
     res.json({ status: 'success', event: logged });
   } catch (err) {
     console.error('POST /api/demo/wazuh-alert failed:', err);

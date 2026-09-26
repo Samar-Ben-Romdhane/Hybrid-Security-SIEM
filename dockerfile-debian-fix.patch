@@ -1,0 +1,37 @@
+diff --git a/Dockerfile b/Dockerfile
+index d9fd50f..a82a3e6 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -11,14 +11,19 @@ COPY . .
+ RUN npm run build
+ 
+ # ---- Production stage ----
+-# Lean runtime image: only production dependencies + the built dist/ output.
+-FROM node:20-alpine AS production
++# Debian-based (not Alpine): Prowler's dependencies (lz4, zstd, etc.) ship
++# prebuilt manylinux/glibc wheels. Alpine's musl libc has no matching prebuilt
++# wheels, so pip falls back to compiling from source and fails with no C
++# compiler present. Debian-slim avoids that entirely.
++FROM node:20-bookworm-slim AS production
+ WORKDIR /app
+ ENV NODE_ENV=production
+ 
+ # Python + Prowler CLI, used by POST /api/prowler/scan to run real on-demand
+ # Azure scans (via an Azure Service Principal - see .env.example).
+-RUN apk add --no-cache python3 py3-pip && \
++RUN apt-get update && \
++    apt-get install -y --no-install-recommends python3 python3-venv && \
++    rm -rf /var/lib/apt/lists/* && \
+     python3 -m venv /opt/prowler-venv && \
+     /opt/prowler-venv/bin/pip install --no-cache-dir --upgrade pip && \
+     /opt/prowler-venv/bin/pip install --no-cache-dir prowler
+@@ -36,7 +41,8 @@ EXPOSE 3000 2222 2323 8080
+ RUN chown -R node:node /app
+ USER node
+ 
++# Debian-slim doesn't ship wget/curl by default, so use Node itself to probe.
+ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+-  CMD wget -qO- http://localhost:3000/api/settings || exit 1
++  CMD node -e "require('http').get('http://localhost:3000/api/settings', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))"
+ 
+ CMD ["node", "dist/server.cjs"]
