@@ -1,0 +1,84 @@
+diff --git a/server.ts b/server.ts
+index 77bc3a2..f5959f3 100644
+--- a/server.ts
++++ b/server.ts
+@@ -569,13 +569,34 @@ app.get('/api/stats', (req, res) => {
+     .sort((a, b) => b.count - a.count)
+     .slice(0, 10);
+ 
++  // Real traffic density over the last 24 hours, bucketed into 6 four-hour
++  // windows, computed from actual event timestamps (not an approximation).
++  const BUCKET_MS = 4 * 60 * 60 * 1000;
++  const BUCKET_COUNT = 6;
++  const now = Date.now();
++  const buckets = Array.from({ length: BUCKET_COUNT }, (_, i) => {
++    const bucketEnd = now - (BUCKET_COUNT - 1 - i) * BUCKET_MS;
++    return {
++      end: bucketEnd,
++      label: new Date(bucketEnd).toTimeString().slice(0, 5),
++      count: 0
++    };
++  });
++  events.forEach((e) => {
++    const t = new Date(e.timestamp).getTime();
++    const bucket = buckets.find((b) => t <= b.end && t > b.end - BUCKET_MS);
++    if (bucket) bucket.count += 1;
++  });
++  const hourly_timeline = buckets.map((b) => ({ hour: b.label, events: b.count }));
++
+   res.json({
+     total_attacks,
+     unique_ips,
+     top_port,
+     protocol_stats,
+     top_attackers,
+-    top_payloads
++    top_payloads,
++    hourly_timeline
+   });
+ });
+ 
+diff --git a/src/App.tsx b/src/App.tsx
+index d10312c..209cc60 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -25,7 +25,8 @@ export default function App() {
+     top_port: '2222',
+     protocol_stats: { SSH: 0, TELNET: 0, HTTP: 0 },
+     top_attackers: [],
+-    top_payloads: []
++    top_payloads: [],
++    hourly_timeline: []
+   });
+   const [threatActors, setThreatActors] = useState<ThreatActor[]>([]);
+   const [settings, setSettings] = useState<SystemSettings>({
+@@ -460,15 +461,8 @@ export default function App() {
+     Attempts: item.count
+   }));
+ 
+-  // 3. Generate mock hourly timeline distribution chart for styling excellence
+-  const timelineChartData = [
+-    { hour: '04:00', Events: Math.floor(events.length * 0.1) || 8 },
+-    { hour: '08:00', Events: Math.floor(events.length * 0.15) || 12 },
+-    { hour: '12:00', Events: Math.floor(events.length * 0.25) || 20 },
+-    { hour: '16:00', Events: Math.floor(events.length * 0.3) || 28 },
+-    { hour: '20:00', Events: Math.floor(events.length * 0.45) || 38 },
+-    { hour: '00:00', Events: Math.floor(events.length * 0.5) || 45 }
+-  ];
++  // Real hourly traffic density, computed server-side from actual event timestamps
++  const timelineChartData = stats.hourly_timeline.map((b) => ({ hour: b.hour, Events: b.events }));
+ 
+   // Paginated log change triggers
+   const handleLogPageChange = (direction: 'next' | 'prev') => {
+diff --git a/src/types.ts b/src/types.ts
+index 4798229..7655df9 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -22,6 +22,7 @@ export interface SecurityStats {
+   protocol_stats: Record<string, number>;
+   top_attackers: Array<{ ip: string; country: string; count: number }>;
+   top_payloads: Array<{ payload: string; count: number }>;
++  hourly_timeline: Array<{ hour: string; events: number }>;
+ }
+ 
+ export interface ThreatActor {
