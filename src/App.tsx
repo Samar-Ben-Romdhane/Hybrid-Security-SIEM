@@ -19,6 +19,7 @@ type TabId = 'dashboard' | 'logs' | 'threats' | 'simulator';
 export default function App() {
   // Main Telemetry States
   const [events, setEvents] = useState<AttackEvent[]>([]);
+  const [wazuhRecentAlerts, setWazuhRecentAlerts] = useState<AttackEvent[]>([]);
   const [stats, setStats] = useState<SecurityStats>({
     total_attacks: 0,
     unique_ips: 0,
@@ -126,6 +127,18 @@ export default function App() {
   };
 
   // Fetch static stats periodically, fallback SSE real-time events
+  const fetchWazuhRecentAlerts = async () => {
+    try {
+      const res = await fetch('/api/events?source=wazuh&perPage=10');
+      if (res.ok) {
+        const data = await res.json();
+        setWazuhRecentAlerts(data.events);
+      }
+    } catch (err) {
+      console.error('Error fetching real Wazuh alerts:', err);
+    }
+  };
+
   const syncTelemetry = async () => {
     try {
       const statsRes = await fetch('/api/stats');
@@ -147,6 +160,7 @@ export default function App() {
       }
 
       await fetchProwlerMetrics();
+      await fetchWazuhRecentAlerts();
     } catch (err) {
       console.error('Error fetching dashboard metrics:', err);
     }
@@ -278,6 +292,16 @@ export default function App() {
           return clipped;
         });
 
+        // Keep the ON-PREM panel's dedicated real-alert feed live too, so it
+        // doesn't need to wait for the next periodic resync and can't get
+        // silently starved by a burst of unrelated (generator/decoy) traffic.
+        if (newEvent.source === 'wazuh') {
+          setWazuhRecentAlerts((prev) => {
+            if (prev.some(evt => evt.id === newEvent.id)) return prev;
+            return [newEvent, ...prev].slice(0, 10);
+          });
+        }
+
         // Recalculate metrics incrementally without hammering the database.
         // (Corrected periodically by the resync interval below, since the
         // server caps stored events at 1000 - this optimistic count alone
@@ -348,6 +372,7 @@ export default function App() {
     // Load initial system stats on mounting
     syncTelemetry();
     queryLogs(1, 'ALL');
+    fetchWazuhRecentAlerts();
 
     // The SSE handler above increments counters optimistically for instant
     // feedback, but has no ceiling - periodically pull the server's real,
@@ -577,7 +602,7 @@ export default function App() {
         {activeTab === 'dashboard' && (
           <div className="space-y-4">
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <WazuhPanel events={events} timeStr={timeStr} />
+              <WazuhPanel events={wazuhRecentAlerts} timeStr={timeStr} />
               <ProwlerPanel metrics={prowlerMetrics} />
             </div>
 

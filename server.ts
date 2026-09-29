@@ -506,10 +506,14 @@ app.get('/api/events', (req, res) => {
   const page = parseInt(req.query.page as string) || 1;
   const perPage = parseInt(req.query.perPage as string) || 30;
   const filterProtocol = req.query.protocol as string;
+  const filterSource = req.query.source as string;
 
   let filtered = [...events];
   if (filterProtocol) {
     filtered = filtered.filter(e => e.protocol === filterProtocol);
+  }
+  if (filterSource) {
+    filtered = filtered.filter(e => e.source === filterSource);
   }
 
   const total = filtered.length;
@@ -702,24 +706,97 @@ app.post('/api/simulate', async (req, res) => {
 
 // Shared logic for recording a Wazuh-style alert, used by both the protected
 // external webhook and the unauthenticated in-dashboard demo trigger below.
+// Recognize RFC1918 private ranges, loopback, and link-local addresses - a
+// real geolocation lookup is meaningless for these (they have no public
+// location), so we label them honestly instead of faking a country.
+function isPrivateOrLocalIP(ip: string): boolean {
+  if (!ip || ip === 'Unknown IP') return true;
+  if (ip === '127.0.0.1' || ip.startsWith('127.')) return true;
+  if (ip.startsWith('169.254.')) return true; // link-local
+  if (ip.startsWith('10.')) return true;
+  if (ip.startsWith('192.168.')) return true;
+  const parts = ip.split('.').map(Number);
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true; // 172.16.0.0/12
+  return false;
+}
+
+interface GeoResult {
+  country: string;
+  city: string;
+  lat: number;
+  lng: number;
+}
+
+// Real IP geolocation via ip-api.com's free JSON endpoint (no key required,
+// reasonable rate limits for a homelab's traffic volume). Falls back to null
+// on any failure so callers can decide their own fallback behavior.
+async function lookupRealGeoIP(ip: string): Promise<GeoResult | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,city,lat,lon`, {
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return null;
+    const data: any = await res.json();
+    if (data.status !== 'success') return null;
+    return { country: data.country, city: data.city, lat: data.lat, lng: data.lon };
+  } catch {
+    return null;
+  }
+}
+
 async function recordWazuhAlert(alert: any, source: AttackSource) {
   // A typical Wazuh alert has `rule`, `agent`, `location`, `data`
   const ruleId = alert.rule?.id || 'Unknown';
   const description = alert.rule?.description || 'Unknown Alert';
   const ip = alert.data?.srcip || alert.srcip || alert.agent?.ip || 'Unknown IP';
 
-  // Try to grab geolocation if Wazuh GeoIP is configured
-  const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
+  let country: string;
+  let city: string;
+  let lat: number;
+  let lng: number;
+
+  if (alert.data?.srcgeoip?.country_name) {
+    // Wazuh's own GeoIP module already resolved it - trust that first.
+    country = alert.data.srcgeoip.country_name;
+    city = alert.data.srcgeoip.city_name;
+    lat = alert.data.srcgeoip.location?.lat;
+    lng = alert.data.srcgeoip.location?.lon;
+  } else if (isPrivateOrLocalIP(ip)) {
+    // No point faking a country for a private/internal address.
+    country = 'Local Network';
+    city = 'Private Range';
+    lat = 0;
+    lng = 0;
+  } else {
+    const real = await lookupRealGeoIP(ip);
+    if (real) {
+      country = real.country;
+      city = real.city;
+      lat = real.lat;
+      lng = real.lng;
+    } else {
+      // Public IP but the lookup itself failed (rate limit, network hiccup) -
+      // fall back to a random location only as a last resort, not by default.
+      const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
+      country = loc.country;
+      city = loc.city;
+      lat = loc.lat;
+      lng = loc.lng;
+    }
+  }
 
   return insertEvent({
     ip,
     port: 22,
     protocol: 'SSH', // Mocked as SSH for brute force context
     payload: `[Rule ${ruleId}] ${description}`,
-    country: alert.data?.srcgeoip?.country_name || loc.country,
-    city: alert.data?.srcgeoip?.city_name || loc.city,
-    lat: alert.data?.srcgeoip?.location?.lat || loc.lat,
-    lng: alert.data?.srcgeoip?.location?.lon || loc.lng,
+    country,
+    city,
+    lat,
+    lng,
     source
   });
 }
