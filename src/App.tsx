@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { AttackEvent, SecurityStats, ThreatActor, SystemSettings, ProwlerMetrics } from './types';
+import { AttackEvent, SecurityStats, ThreatActor, SystemSettings, ProwlerMetrics, ProwlerFinding } from './types';
 
 import AlertToasts from './components/AlertToasts';
 import DashboardHeader from './components/DashboardHeader';
@@ -43,6 +43,7 @@ export default function App() {
     passes: 0,
     updated_at: null
   });
+  const [prowlerFindings, setProwlerFindings] = useState<ProwlerFinding[]>([]);
 
   // UI Control States
   const [activeTab, setActiveTab] = useState<TabId>('dashboard');
@@ -126,6 +127,17 @@ export default function App() {
     }
   };
 
+  const fetchProwlerFindings = async () => {
+    try {
+      const res = await fetch('/api/prowler/findings');
+      if (res.ok) {
+        setProwlerFindings(await res.json());
+      }
+    } catch (err) {
+      console.error('Error fetching Prowler findings:', err);
+    }
+  };
+
   // Fetch static stats periodically, fallback SSE real-time events
   const fetchWazuhRecentAlerts = async () => {
     try {
@@ -160,6 +172,7 @@ export default function App() {
       }
 
       await fetchProwlerMetrics();
+      await fetchProwlerFindings();
       await fetchWazuhRecentAlerts();
     } catch (err) {
       console.error('Error fetching dashboard metrics:', err);
@@ -461,6 +474,7 @@ export default function App() {
             clearInterval(cloudScanPollRef.current!);
             setCloudScanStatus('done');
             await fetchProwlerMetrics();
+            await fetchProwlerFindings();
             setTimeout(() => setCloudScanStatus('idle'), 5000);
           } else if (state.status === 'failed') {
             clearInterval(cloudScanPollRef.current!);
@@ -603,7 +617,7 @@ export default function App() {
           <div className="space-y-4">
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <WazuhPanel events={wazuhRecentAlerts} timeStr={timeStr} />
-              <ProwlerPanel metrics={prowlerMetrics} />
+              <ProwlerPanel metrics={prowlerMetrics} findings={prowlerFindings} />
             </div>
 
             <ChartsPanel

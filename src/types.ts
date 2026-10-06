@@ -50,3 +50,14 @@ export interface ProwlerMetrics {
   passes: number;
   updated_at: string | null;
 }
+
+export interface ProwlerFinding {
+  id: number;
+  check_title: string;
+  resource_name: string;
+  severity: string;
+  detail: string | null;
+  port: string | null;
+  source: string | null;
+  scanned_at: string;
+}

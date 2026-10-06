@@ -74,6 +74,17 @@ interface ProwlerMetrics {
   updated_at: string | null;
 }
 
+interface ProwlerFinding {
+  id: number;
+  check_title: string;
+  resource_name: string;
+  severity: string;
+  detail: string | null;
+  port: string | null;
+  source: string | null;
+  scanned_at: string;
+}
+
 // In-memory caches, mirrored to/from Postgres so the existing synchronous
 // aggregation logic (stats/threats/pagination) doesn't need a full rewrite.
 let events: AttackEvent[] = [];
@@ -88,6 +99,7 @@ let latestProwlerMetrics: ProwlerMetrics = {
   passes: 0,
   updated_at: null
 };
+let latestProwlerFindings: ProwlerFinding[] = [];
 
 // SSE active channels
 let sseClients: any[] = [];
@@ -129,6 +141,19 @@ async function initSchema() {
       fails INTEGER NOT NULL,
       passes INTEGER NOT NULL,
       updated_at TIMESTAMPTZ
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS prowler_findings (
+      id SERIAL PRIMARY KEY,
+      check_title TEXT NOT NULL,
+      resource_name TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      detail TEXT,
+      port TEXT,
+      source TEXT,
+      scanned_at TIMESTAMPTZ NOT NULL
     );
   `);
 }
@@ -183,6 +208,18 @@ async function loadStateFromDb() {
       updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null
     };
   }
+
+  const findingsResult = await pool.query('SELECT * FROM prowler_findings ORDER BY id ASC');
+  latestProwlerFindings = findingsResult.rows.map((row) => ({
+    id: row.id,
+    check_title: row.check_title,
+    resource_name: row.resource_name,
+    severity: row.severity,
+    detail: row.detail,
+    port: row.port,
+    source: row.source,
+    scanned_at: new Date(row.scanned_at).toISOString()
+  }));
 }
 
 async function seedDatabase() {
@@ -268,6 +305,81 @@ async function insertEvent(eventData: Omit<AttackEvent, 'id' | 'timestamp'>): Pr
   });
 
   return newEvent;
+}
+
+// Prowler's generic OCSF output doesn't have dedicated structured fields for
+// "port" or "source CIDR" on NSG checks - that detail usually only exists in
+// the human-readable status/detail text. Best-effort extraction from there;
+// falls back to '-' rather than fabricating a value when nothing is found.
+const PORT_KEYWORDS: Record<string, string> = {
+  ssh: '22', rdp: '3389', mysql: '3306', postgres: '5432', postgresql: '5432',
+  http: '80', https: '443', ftp: '21', telnet: '23', smb: '445', redis: '6379'
+};
+
+function extractPort(text: string): string {
+  const explicit = text.match(/port\s+(\d{1,5})/i) || text.match(/:(\d{1,5})\b/);
+  if (explicit) return explicit[1];
+  const lower = text.toLowerCase();
+  for (const [keyword, port] of Object.entries(PORT_KEYWORDS)) {
+    if (lower.includes(keyword)) return port;
+  }
+  return '-';
+}
+
+function extractSource(text: string): string {
+  const cidr = text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}\b/);
+  if (cidr) return cidr[0];
+  if (/\binternet\b/i.test(text) || /\bany\b/i.test(text)) return '0.0.0.0/0';
+  return '-';
+}
+
+async function replaceProwlerFindings(rawFailedChecks: any[]): Promise<ProwlerFinding[]> {
+  const scannedAt = new Date().toISOString();
+
+  const findings = rawFailedChecks.map((check) => {
+    const checkTitle: string =
+      check.finding_info?.title || check.CheckTitle || check.message || check.metadata?.event_code || 'Unknown Check';
+    const resourceName: string =
+      check.resources?.[0]?.name || check.ResourceId || check.Resource || 'Unknown Resource';
+    const severity: string = check.severity || check.Severity || check.finding_info?.severity || 'Unknown';
+    const detail: string = check.status_detail || check.message || check.StatusExtended || '';
+
+    return {
+      check_title: String(checkTitle).slice(0, 300),
+      resource_name: String(resourceName).slice(0, 200),
+      severity: String(severity).slice(0, 50),
+      detail: String(detail).slice(0, 500),
+      port: extractPort(detail),
+      source: extractSource(detail),
+      scanned_at: scannedAt
+    };
+  });
+
+  // Snapshot replace: each scan's violations supersede the previous scan's,
+  // same semantics as how prowler_metrics already works as a single snapshot.
+  await pool.query('DELETE FROM prowler_findings');
+
+  for (const f of findings) {
+    await pool.query(
+      `INSERT INTO prowler_findings (check_title, resource_name, severity, detail, port, source, scanned_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [f.check_title, f.resource_name, f.severity, f.detail, f.port, f.source, f.scanned_at]
+    );
+  }
+
+  const { rows } = await pool.query('SELECT * FROM prowler_findings ORDER BY id ASC');
+  latestProwlerFindings = rows.map((row) => ({
+    id: row.id,
+    check_title: row.check_title,
+    resource_name: row.resource_name,
+    severity: row.severity,
+    detail: row.detail,
+    port: row.port,
+    source: row.source,
+    scanned_at: new Date(row.scanned_at).toISOString()
+  }));
+
+  return latestProwlerFindings;
 }
 
 async function upsertProwlerMetrics(metrics: Omit<ProwlerMetrics, 'updated_at'>): Promise<ProwlerMetrics> {
@@ -870,14 +982,22 @@ async function processProwlerUpload(prowlerData: unknown) {
   let fails = 0;
   let passes = 0;
 
+  let failedChecks: any[];
   if (nsgChecks.length > 0) {
-    fails = nsgChecks.filter(isFail).length;
+    failedChecks = nsgChecks.filter(isFail);
+    fails = failedChecks.length;
     passes = nsgChecks.filter(isPass).length;
   } else {
     // If no specific NSG checks found, just sum overall passes/fails for the PoC
-    fails = prowlerData.filter(isFail).length;
+    failedChecks = prowlerData.filter(isFail);
+    fails = failedChecks.length;
     passes = prowlerData.filter(isPass).length;
   }
+
+  // Persist the real per-finding detail behind the aggregate counts, so the
+  // dashboard's violations table can show actual scan results instead of
+  // static sample rows.
+  await replaceProwlerFindings(failedChecks);
 
   return upsertProwlerMetrics({
     total_nsg_checks: nsgChecks.length > 0 ? nsgChecks.length : prowlerData.length,
@@ -923,6 +1043,11 @@ app.post('/api/demo/prowler-scan', async (req, res) => {
 // GET /api/prowler/metrics - Latest persisted Prowler compliance metrics
 app.get('/api/prowler/metrics', (req, res) => {
   res.json(latestProwlerMetrics);
+});
+
+// GET /api/prowler/findings - Real per-finding detail behind the aggregate metrics
+app.get('/api/prowler/findings', (req, res) => {
+  res.json(latestProwlerFindings);
 });
 
 // --- Real on-demand Prowler scan against the actual Azure environment ---

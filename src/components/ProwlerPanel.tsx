@@ -1,12 +1,22 @@
 import React from 'react';
 import { Globe } from 'lucide-react';
-import { ProwlerMetrics } from '../types';
+import { ProwlerMetrics, ProwlerFinding } from '../types';
 
 interface ProwlerPanelProps {
   metrics: ProwlerMetrics;
+  findings: ProwlerFinding[];
 }
 
-export default function ProwlerPanel({ metrics }: ProwlerPanelProps) {
+function severityBadgeClass(severity: string): string {
+  const s = severity.toLowerCase();
+  if (s === 'critical') return 'bg-red-900/50 text-red-300';
+  if (s === 'high') return 'bg-amber-900/50 text-amber-300';
+  if (s === 'medium') return 'bg-blue-900/50 text-blue-300';
+  if (s === 'low' || s === 'informational') return 'bg-slate-800 text-slate-400';
+  return 'bg-slate-800 text-slate-400';
+}
+
+export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
   return (
     <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[520px] shadow-sm">
       <div className="bg-slate-900/80 p-3 border-b border-slate-800 flex justify-between items-center">
@@ -32,43 +42,41 @@ export default function ProwlerPanel({ metrics }: ProwlerPanelProps) {
 
         <h3 className="text-[10px] font-bold uppercase text-slate-500 mb-3 border-b border-slate-800 pb-1">NSG Rule Violations</h3>
 
-        {/*
-          NOTE: The Prowler upload endpoint currently only persists aggregate
-          pass/fail counts, not per-rule detail, so this table stays as
-          illustrative sample data until per-finding storage is added.
-        */}
-        <div className="overflow-x-auto border border-slate-800 rounded-lg">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="bg-slate-900 text-[8px] text-slate-400 uppercase tracking-widest border-b border-slate-800">
-                <th className="p-2 font-bold">NSG Name</th>
-                <th className="p-2 font-bold">Port</th>
-                <th className="p-2 font-bold">Source</th>
-                <th className="p-2 font-bold">Risk</th>
-              </tr>
-            </thead>
-            <tbody className="text-[9px] text-slate-300">
-              <tr className="border-b border-slate-800/50 hover:bg-slate-900/30">
-                <td className="p-2">web-prod-nsg</td>
-                <td className="p-2 text-red-400 font-bold">22</td>
-                <td className="p-2">0.0.0.0/0</td>
-                <td className="p-2"><span className="bg-red-900/50 text-red-300 px-1.5 py-0.5 rounded text-[8px] uppercase font-bold">CRITICAL</span></td>
-              </tr>
-              <tr className="border-b border-slate-800/50 hover:bg-slate-900/30">
-                <td className="p-2">db-internal-nsg</td>
-                <td className="p-2 text-amber-400 font-bold">3306</td>
-                <td className="p-2">Any</td>
-                <td className="p-2"><span className="bg-amber-900/50 text-amber-300 px-1.5 py-0.5 rounded text-[8px] uppercase font-bold">HIGH</span></td>
-              </tr>
-              <tr className="hover:bg-slate-900/30">
-                <td className="p-2">jumpbox-nsg</td>
-                <td className="p-2 text-blue-400 font-bold">3389</td>
-                <td className="p-2">0.0.0.0/0</td>
-                <td className="p-2"><span className="bg-red-900/50 text-red-300 px-1.5 py-0.5 rounded text-[8px] uppercase font-bold">CRITICAL</span></td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+        {findings.length === 0 ? (
+          <div className="text-[10px] text-slate-600 italic text-center py-8 border border-slate-800 rounded-lg">
+            {metrics.updated_at ? 'Clean scan - no NSG violations found.' : 'No scan run yet.'}
+          </div>
+        ) : (
+          <div className="overflow-x-auto border border-slate-800 rounded-lg">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="bg-slate-900 text-[8px] text-slate-400 uppercase tracking-widest border-b border-slate-800">
+                  <th className="p-2 font-bold">NSG Name</th>
+                  <th className="p-2 font-bold">Port</th>
+                  <th className="p-2 font-bold">Source</th>
+                  <th className="p-2 font-bold">Risk</th>
+                </tr>
+              </thead>
+              <tbody className="text-[9px] text-slate-300">
+                {findings.map((f, idx) => (
+                  <tr
+                    key={f.id}
+                    className={idx < findings.length - 1 ? 'border-b border-slate-800/50 hover:bg-slate-900/30' : 'hover:bg-slate-900/30'}
+                  >
+                    <td className="p-2 truncate max-w-[140px]" title={f.check_title}>{f.resource_name}</td>
+                    <td className="p-2 font-bold">{f.port || '-'}</td>
+                    <td className="p-2">{f.source || '-'}</td>
+                    <td className="p-2">
+                      <span className={`px-1.5 py-0.5 rounded text-[8px] uppercase font-bold ${severityBadgeClass(f.severity)}`}>
+                        {f.severity}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
 
       </div>
     </div>

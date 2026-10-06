@@ -1,0 +1,378 @@
+diff --git a/server.ts b/server.ts
+index 51fd266..027a981 100644
+--- a/server.ts
++++ b/server.ts
+@@ -74,6 +74,17 @@ interface ProwlerMetrics {
+   updated_at: string | null;
+ }
+ 
++interface ProwlerFinding {
++  id: number;
++  check_title: string;
++  resource_name: string;
++  severity: string;
++  detail: string | null;
++  port: string | null;
++  source: string | null;
++  scanned_at: string;
++}
++
+ // In-memory caches, mirrored to/from Postgres so the existing synchronous
+ // aggregation logic (stats/threats/pagination) doesn't need a full rewrite.
+ let events: AttackEvent[] = [];
+@@ -88,6 +99,7 @@ let latestProwlerMetrics: ProwlerMetrics = {
+   passes: 0,
+   updated_at: null
+ };
++let latestProwlerFindings: ProwlerFinding[] = [];
+ 
+ // SSE active channels
+ let sseClients: any[] = [];
+@@ -131,6 +143,19 @@ async function initSchema() {
+       updated_at TIMESTAMPTZ
+     );
+   `);
++
++  await pool.query(`
++    CREATE TABLE IF NOT EXISTS prowler_findings (
++      id SERIAL PRIMARY KEY,
++      check_title TEXT NOT NULL,
++      resource_name TEXT NOT NULL,
++      severity TEXT NOT NULL,
++      detail TEXT,
++      port TEXT,
++      source TEXT,
++      scanned_at TIMESTAMPTZ NOT NULL
++    );
++  `);
+ }
+ 
+ function rowToEvent(row: any): AttackEvent {
+@@ -183,6 +208,18 @@ async function loadStateFromDb() {
+       updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null
+     };
+   }
++
++  const findingsResult = await pool.query('SELECT * FROM prowler_findings ORDER BY id ASC');
++  latestProwlerFindings = findingsResult.rows.map((row) => ({
++    id: row.id,
++    check_title: row.check_title,
++    resource_name: row.resource_name,
++    severity: row.severity,
++    detail: row.detail,
++    port: row.port,
++    source: row.source,
++    scanned_at: new Date(row.scanned_at).toISOString()
++  }));
+ }
+ 
+ async function seedDatabase() {
+@@ -270,6 +307,81 @@ async function insertEvent(eventData: Omit<AttackEvent, 'id' | 'timestamp'>): Pr
+   return newEvent;
+ }
+ 
++// Prowler's generic OCSF output doesn't have dedicated structured fields for
++// "port" or "source CIDR" on NSG checks - that detail usually only exists in
++// the human-readable status/detail text. Best-effort extraction from there;
++// falls back to '-' rather than fabricating a value when nothing is found.
++const PORT_KEYWORDS: Record<string, string> = {
++  ssh: '22', rdp: '3389', mysql: '3306', postgres: '5432', postgresql: '5432',
++  http: '80', https: '443', ftp: '21', telnet: '23', smb: '445', redis: '6379'
++};
++
++function extractPort(text: string): string {
++  const explicit = text.match(/port\s+(\d{1,5})/i) || text.match(/:(\d{1,5})\b/);
++  if (explicit) return explicit[1];
++  const lower = text.toLowerCase();
++  for (const [keyword, port] of Object.entries(PORT_KEYWORDS)) {
++    if (lower.includes(keyword)) return port;
++  }
++  return '-';
++}
++
++function extractSource(text: string): string {
++  const cidr = text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}\b/);
++  if (cidr) return cidr[0];
++  if (/\binternet\b/i.test(text) || /\bany\b/i.test(text)) return '0.0.0.0/0';
++  return '-';
++}
++
++async function replaceProwlerFindings(rawFailedChecks: any[]): Promise<ProwlerFinding[]> {
++  const scannedAt = new Date().toISOString();
++
++  const findings = rawFailedChecks.map((check) => {
++    const checkTitle: string =
++      check.finding_info?.title || check.CheckTitle || check.message || check.metadata?.event_code || 'Unknown Check';
++    const resourceName: string =
++      check.resources?.[0]?.name || check.ResourceId || check.Resource || 'Unknown Resource';
++    const severity: string = check.severity || check.Severity || check.finding_info?.severity || 'Unknown';
++    const detail: string = check.status_detail || check.message || check.StatusExtended || '';
++
++    return {
++      check_title: String(checkTitle).slice(0, 300),
++      resource_name: String(resourceName).slice(0, 200),
++      severity: String(severity).slice(0, 50),
++      detail: String(detail).slice(0, 500),
++      port: extractPort(detail),
++      source: extractSource(detail),
++      scanned_at: scannedAt
++    };
++  });
++
++  // Snapshot replace: each scan's violations supersede the previous scan's,
++  // same semantics as how prowler_metrics already works as a single snapshot.
++  await pool.query('DELETE FROM prowler_findings');
++
++  for (const f of findings) {
++    await pool.query(
++      `INSERT INTO prowler_findings (check_title, resource_name, severity, detail, port, source, scanned_at)
++       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
++      [f.check_title, f.resource_name, f.severity, f.detail, f.port, f.source, f.scanned_at]
++    );
++  }
++
++  const { rows } = await pool.query('SELECT * FROM prowler_findings ORDER BY id ASC');
++  latestProwlerFindings = rows.map((row) => ({
++    id: row.id,
++    check_title: row.check_title,
++    resource_name: row.resource_name,
++    severity: row.severity,
++    detail: row.detail,
++    port: row.port,
++    source: row.source,
++    scanned_at: new Date(row.scanned_at).toISOString()
++  }));
++
++  return latestProwlerFindings;
++}
++
+ async function upsertProwlerMetrics(metrics: Omit<ProwlerMetrics, 'updated_at'>): Promise<ProwlerMetrics> {
+   const updated: ProwlerMetrics = { ...metrics, updated_at: new Date().toISOString() };
+ 
+@@ -870,15 +982,23 @@ async function processProwlerUpload(prowlerData: unknown) {
+   let fails = 0;
+   let passes = 0;
+ 
++  let failedChecks: any[];
+   if (nsgChecks.length > 0) {
+-    fails = nsgChecks.filter(isFail).length;
++    failedChecks = nsgChecks.filter(isFail);
++    fails = failedChecks.length;
+     passes = nsgChecks.filter(isPass).length;
+   } else {
+     // If no specific NSG checks found, just sum overall passes/fails for the PoC
+-    fails = prowlerData.filter(isFail).length;
++    failedChecks = prowlerData.filter(isFail);
++    fails = failedChecks.length;
+     passes = prowlerData.filter(isPass).length;
+   }
+ 
++  // Persist the real per-finding detail behind the aggregate counts, so the
++  // dashboard's violations table can show actual scan results instead of
++  // static sample rows.
++  await replaceProwlerFindings(failedChecks);
++
+   return upsertProwlerMetrics({
+     total_nsg_checks: nsgChecks.length > 0 ? nsgChecks.length : prowlerData.length,
+     fails,
+@@ -925,6 +1045,11 @@ app.get('/api/prowler/metrics', (req, res) => {
+   res.json(latestProwlerMetrics);
+ });
+ 
++// GET /api/prowler/findings - Real per-finding detail behind the aggregate metrics
++app.get('/api/prowler/findings', (req, res) => {
++  res.json(latestProwlerFindings);
++});
++
+ // --- Real on-demand Prowler scan against the actual Azure environment ---
+ // Uses a Service Principal (--sp-env-auth) since interactive az-cli/browser
+ // login isn't available from a server-side button click.
+diff --git a/src/App.tsx b/src/App.tsx
+index 5eceeb4..5773b71 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -1,5 +1,5 @@
+ import React, { useState, useEffect, useRef } from 'react';
+-import { AttackEvent, SecurityStats, ThreatActor, SystemSettings, ProwlerMetrics } from './types';
++import { AttackEvent, SecurityStats, ThreatActor, SystemSettings, ProwlerMetrics, ProwlerFinding } from './types';
+ 
+ import AlertToasts from './components/AlertToasts';
+ import DashboardHeader from './components/DashboardHeader';
+@@ -43,6 +43,7 @@ export default function App() {
+     passes: 0,
+     updated_at: null
+   });
++  const [prowlerFindings, setProwlerFindings] = useState<ProwlerFinding[]>([]);
+ 
+   // UI Control States
+   const [activeTab, setActiveTab] = useState<TabId>('dashboard');
+@@ -126,6 +127,17 @@ export default function App() {
+     }
+   };
+ 
++  const fetchProwlerFindings = async () => {
++    try {
++      const res = await fetch('/api/prowler/findings');
++      if (res.ok) {
++        setProwlerFindings(await res.json());
++      }
++    } catch (err) {
++      console.error('Error fetching Prowler findings:', err);
++    }
++  };
++
+   // Fetch static stats periodically, fallback SSE real-time events
+   const fetchWazuhRecentAlerts = async () => {
+     try {
+@@ -160,6 +172,7 @@ export default function App() {
+       }
+ 
+       await fetchProwlerMetrics();
++      await fetchProwlerFindings();
+       await fetchWazuhRecentAlerts();
+     } catch (err) {
+       console.error('Error fetching dashboard metrics:', err);
+@@ -461,6 +474,7 @@ export default function App() {
+             clearInterval(cloudScanPollRef.current!);
+             setCloudScanStatus('done');
+             await fetchProwlerMetrics();
++            await fetchProwlerFindings();
+             setTimeout(() => setCloudScanStatus('idle'), 5000);
+           } else if (state.status === 'failed') {
+             clearInterval(cloudScanPollRef.current!);
+@@ -603,7 +617,7 @@ export default function App() {
+           <div className="space-y-4">
+             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+               <WazuhPanel events={wazuhRecentAlerts} timeStr={timeStr} />
+-              <ProwlerPanel metrics={prowlerMetrics} />
++              <ProwlerPanel metrics={prowlerMetrics} findings={prowlerFindings} />
+             </div>
+ 
+             <ChartsPanel
+diff --git a/src/components/ProwlerPanel.tsx b/src/components/ProwlerPanel.tsx
+index f5811f2..dd1385f 100644
+--- a/src/components/ProwlerPanel.tsx
++++ b/src/components/ProwlerPanel.tsx
+@@ -1,12 +1,22 @@
+ import React from 'react';
+ import { Globe } from 'lucide-react';
+-import { ProwlerMetrics } from '../types';
++import { ProwlerMetrics, ProwlerFinding } from '../types';
+ 
+ interface ProwlerPanelProps {
+   metrics: ProwlerMetrics;
++  findings: ProwlerFinding[];
+ }
+ 
+-export default function ProwlerPanel({ metrics }: ProwlerPanelProps) {
++function severityBadgeClass(severity: string): string {
++  const s = severity.toLowerCase();
++  if (s === 'critical') return 'bg-red-900/50 text-red-300';
++  if (s === 'high') return 'bg-amber-900/50 text-amber-300';
++  if (s === 'medium') return 'bg-blue-900/50 text-blue-300';
++  if (s === 'low' || s === 'informational') return 'bg-slate-800 text-slate-400';
++  return 'bg-slate-800 text-slate-400';
++}
++
++export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
+   return (
+     <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[520px] shadow-sm">
+       <div className="bg-slate-900/80 p-3 border-b border-slate-800 flex justify-between items-center">
+@@ -32,43 +42,41 @@ export default function ProwlerPanel({ metrics }: ProwlerPanelProps) {
+ 
+         <h3 className="text-[10px] font-bold uppercase text-slate-500 mb-3 border-b border-slate-800 pb-1">NSG Rule Violations</h3>
+ 
+-        {/*
+-          NOTE: The Prowler upload endpoint currently only persists aggregate
+-          pass/fail counts, not per-rule detail, so this table stays as
+-          illustrative sample data until per-finding storage is added.
+-        */}
+-        <div className="overflow-x-auto border border-slate-800 rounded-lg">
+-          <table className="w-full text-left border-collapse">
+-            <thead>
+-              <tr className="bg-slate-900 text-[8px] text-slate-400 uppercase tracking-widest border-b border-slate-800">
+-                <th className="p-2 font-bold">NSG Name</th>
+-                <th className="p-2 font-bold">Port</th>
+-                <th className="p-2 font-bold">Source</th>
+-                <th className="p-2 font-bold">Risk</th>
+-              </tr>
+-            </thead>
+-            <tbody className="text-[9px] text-slate-300">
+-              <tr className="border-b border-slate-800/50 hover:bg-slate-900/30">
+-                <td className="p-2">web-prod-nsg</td>
+-                <td className="p-2 text-red-400 font-bold">22</td>
+-                <td className="p-2">0.0.0.0/0</td>
+-                <td className="p-2"><span className="bg-red-900/50 text-red-300 px-1.5 py-0.5 rounded text-[8px] uppercase font-bold">CRITICAL</span></td>
+-              </tr>
+-              <tr className="border-b border-slate-800/50 hover:bg-slate-900/30">
+-                <td className="p-2">db-internal-nsg</td>
+-                <td className="p-2 text-amber-400 font-bold">3306</td>
+-                <td className="p-2">Any</td>
+-                <td className="p-2"><span className="bg-amber-900/50 text-amber-300 px-1.5 py-0.5 rounded text-[8px] uppercase font-bold">HIGH</span></td>
+-              </tr>
+-              <tr className="hover:bg-slate-900/30">
+-                <td className="p-2">jumpbox-nsg</td>
+-                <td className="p-2 text-blue-400 font-bold">3389</td>
+-                <td className="p-2">0.0.0.0/0</td>
+-                <td className="p-2"><span className="bg-red-900/50 text-red-300 px-1.5 py-0.5 rounded text-[8px] uppercase font-bold">CRITICAL</span></td>
+-              </tr>
+-            </tbody>
+-          </table>
+-        </div>
++        {findings.length === 0 ? (
++          <div className="text-[10px] text-slate-600 italic text-center py-8 border border-slate-800 rounded-lg">
++            {metrics.updated_at ? 'Clean scan - no NSG violations found.' : 'No scan run yet.'}
++          </div>
++        ) : (
++          <div className="overflow-x-auto border border-slate-800 rounded-lg">
++            <table className="w-full text-left border-collapse">
++              <thead>
++                <tr className="bg-slate-900 text-[8px] text-slate-400 uppercase tracking-widest border-b border-slate-800">
++                  <th className="p-2 font-bold">NSG Name</th>
++                  <th className="p-2 font-bold">Port</th>
++                  <th className="p-2 font-bold">Source</th>
++                  <th className="p-2 font-bold">Risk</th>
++                </tr>
++              </thead>
++              <tbody className="text-[9px] text-slate-300">
++                {findings.map((f, idx) => (
++                  <tr
++                    key={f.id}
++                    className={idx < findings.length - 1 ? 'border-b border-slate-800/50 hover:bg-slate-900/30' : 'hover:bg-slate-900/30'}
++                  >
++                    <td className="p-2 truncate max-w-[140px]" title={f.check_title}>{f.resource_name}</td>
++                    <td className="p-2 font-bold">{f.port || '-'}</td>
++                    <td className="p-2">{f.source || '-'}</td>
++                    <td className="p-2">
++                      <span className={`px-1.5 py-0.5 rounded text-[8px] uppercase font-bold ${severityBadgeClass(f.severity)}`}>
++                        {f.severity}
++                      </span>
++                    </td>
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++          </div>
++        )}
+ 
+       </div>
+     </div>
+diff --git a/src/types.ts b/src/types.ts
+index bc81fc0..637193a 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -50,3 +50,14 @@ export interface ProwlerMetrics {
+   passes: number;
+   updated_at: string | null;
+ }
++
++export interface ProwlerFinding {
++  id: number;
++  check_title: string;
++  resource_name: string;
++  severity: string;
++  detail: string | null;
++  port: string | null;
++  source: string | null;
++  scanned_at: string;
++}
