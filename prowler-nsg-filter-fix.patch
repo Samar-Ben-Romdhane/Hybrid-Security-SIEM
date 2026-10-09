@@ -1,0 +1,90 @@
+diff --git a/server.ts b/server.ts
+index 027a981..f5b2aeb 100644
+--- a/server.ts
++++ b/server.ts
+@@ -316,9 +316,21 @@ const PORT_KEYWORDS: Record<string, string> = {
+   http: '80', https: '443', ftp: '21', telnet: '23', smb: '445', redis: '6379'
+ };
+ 
+-function extractPort(text: string): string {
++// The check ID is the most reliable signal (it can't be polluted by an NSG or
++// subscription that happens to be named "ssh-something"), so use it first and
++// only fall back to scanning the free-text message.
++const CHECK_ID_PORTS: Array<[string, string]> = [
++  ['_ssh_', '22'], ['_rdp_', '3389'], ['_https_', '443'], ['_http_', '80'], ['_udp_', 'UDP']
++];
++
++function extractPort(text: string, checkId: string = ''): string {
++  const id = checkId.toLowerCase();
++  for (const [needle, port] of CHECK_ID_PORTS) {
++    if (id.includes(needle)) return port;
++  }
+   const explicit = text.match(/port\s+(\d{1,5})/i) || text.match(/:(\d{1,5})\b/);
+   if (explicit) return explicit[1];
++  if (id) return '-'; // known check with no port meaning: don't guess from names in the text
+   const lower = text.toLowerCase();
+   for (const [keyword, port] of Object.entries(PORT_KEYWORDS)) {
+     if (lower.includes(keyword)) return port;
+@@ -326,7 +338,9 @@ function extractPort(text: string): string {
+   return '-';
+ }
+ 
+-function extractSource(text: string): string {
++function extractSource(text: string, checkId: string = ''): string {
++  // A FAIL on an *_internet_access_restricted check means the NSG allows it from the Internet.
++  if (/internet_access_restricted/i.test(checkId)) return 'Internet';
+   const cidr = text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}\b/);
+   if (cidr) return cidr[0];
+   if (/\binternet\b/i.test(text) || /\bany\b/i.test(text)) return '0.0.0.0/0';
+@@ -344,13 +358,15 @@ async function replaceProwlerFindings(rawFailedChecks: any[]): Promise<ProwlerFi
+     const severity: string = check.severity || check.Severity || check.finding_info?.severity || 'Unknown';
+     const detail: string = check.status_detail || check.message || check.StatusExtended || '';
+ 
++    const checkId: string = String(check.metadata?.event_code || check.CheckID || '');
++
+     return {
+       check_title: String(checkTitle).slice(0, 300),
+       resource_name: String(resourceName).slice(0, 200),
+       severity: String(severity).slice(0, 50),
+       detail: String(detail).slice(0, 500),
+-      port: extractPort(detail),
+-      source: extractSource(detail),
++      port: extractPort(detail, checkId),
++      source: extractSource(detail, checkId),
+       scanned_at: scannedAt
+     };
+   });
+@@ -955,20 +971,20 @@ async function processProwlerUpload(prowlerData: unknown) {
+   // v3 -> OCSF migration table:
+   //   CheckID -> metadata.event_code | ServiceName -> resources[].group.name
+   //   ResourceType -> resources[].type | Status -> status_code
++  // Real Azure NSG checks in Prowler are named network_{ssh,rdp,http,https,tcp,udp}_internet_access_restricted
++  // (plus network_subnet_nsg_associated) and report on microsoft.network/networksecuritygroups.
++  // Other checks in the "network" service (Bastion, flow logs, DDoS, Network Watcher, Shodan)
++  // are NOT NSG rule findings, so matching on the service name alone would be far too broad.
++  const NSG_CHECK_ID = /^network_(ssh|rdp|http|https|tcp|udp)_internet_access_restricted$|nsg|security_group/;
+   const isNsgCheck = (check: any): boolean => {
+-    // Legacy V3 native JSON
+-    if (check.ServiceName === 'virtualnetwork' && check.ResourceType === 'networksecuritygroups') return true;
+-    if (typeof check.CheckID === 'string' && check.CheckID.toLowerCase().includes('security_group')) return true;
+-
+-    // Current OCSF v1.1.0 (default since Prowler v4/v5)
+-    const eventCode: string = check.metadata?.event_code || '';
+-    if (eventCode.toLowerCase().includes('security_group')) return true;
+-
+-    const resources: any[] = Array.isArray(check.resources) ? check.resources : [];
+-    return resources.some((r) =>
+-      r?.group?.name?.toLowerCase?.().includes('network') ||
+-      r?.type?.toLowerCase?.().includes('networksecuritygroup')
+-    );
++    const checkId = String(check.metadata?.event_code || check.CheckID || '').toLowerCase();
++    if (NSG_CHECK_ID.test(checkId)) return true;
++
++    const resourceTypes: string[] = [
++      check.ResourceType,
++      ...(Array.isArray(check.resources) ? check.resources.map((r: any) => r?.type) : [])
++    ].filter(Boolean).map((t) => String(t).toLowerCase());
++    return resourceTypes.some((t) => t.includes('networksecuritygroup'));
+   };
+ 
+   const isFail = (check: any): boolean =>
