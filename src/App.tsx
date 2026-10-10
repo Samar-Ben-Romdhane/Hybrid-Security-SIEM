@@ -141,7 +141,7 @@ export default function App() {
   // Fetch static stats periodically, fallback SSE real-time events
   const fetchWazuhRecentAlerts = async () => {
     try {
-      const res = await fetch('/api/events?source=wazuh&perPage=10');
+      const res = await fetch('/api/events?source=wazuh&perPage=50');
       if (res.ok) {
         const data = await res.json();
         setWazuhRecentAlerts(data.events);
@@ -311,7 +311,7 @@ export default function App() {
         if (newEvent.source === 'wazuh') {
           setWazuhRecentAlerts((prev) => {
             if (prev.some(evt => evt.id === newEvent.id)) return prev;
-            return [newEvent, ...prev].slice(0, 10);
+            return [newEvent, ...prev].slice(0, 50);
           });
         }
 

@@ -1,6 +1,9 @@
 import React from 'react';
 import { Globe } from 'lucide-react';
 import { ProwlerMetrics, ProwlerFinding } from '../types';
+import Pagination, { usePagination } from './Pagination';
+
+const PAGE_SIZE = 5;
 
 interface ProwlerPanelProps {
   metrics: ProwlerMetrics;
@@ -17,6 +20,8 @@ function severityBadgeClass(severity: string): string {
 }
 
 export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
+  const pg = usePagination(findings, PAGE_SIZE);
+
   return (
     <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[520px] shadow-sm">
       <div className="bg-slate-900/80 p-3 border-b border-slate-800 flex justify-between items-center">
@@ -58,10 +63,10 @@ export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
                 </tr>
               </thead>
               <tbody className="text-[9px] text-slate-300">
-                {findings.map((f, idx) => (
+                {pg.pageItems.map((f, idx) => (
                   <tr
                     key={f.id}
-                    className={idx < findings.length - 1 ? 'border-b border-slate-800/50 hover:bg-slate-900/30' : 'hover:bg-slate-900/30'}
+                    className={idx < pg.pageItems.length - 1 ?'border-b border-slate-800/50 hover:bg-slate-900/30' : 'hover:bg-slate-900/30'}
                   >
                     <td className="p-2 truncate max-w-[140px]" title={f.check_title}>{f.resource_name}</td>
                     <td className="p-2 font-bold">{f.port || '-'}</td>
@@ -79,6 +84,8 @@ export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
         )}
 
       </div>
+
+      <Pagination page={pg.page} totalPages={pg.totalPages} total={pg.total} pageSize={pg.pageSize} onPageChange={pg.setPage} />
     </div>
   );
 }

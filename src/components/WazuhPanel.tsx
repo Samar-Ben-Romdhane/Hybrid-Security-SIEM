@@ -1,6 +1,9 @@
 import React from 'react';
 import { Server } from 'lucide-react';
 import { AttackEvent } from '../types';
+import Pagination, { usePagination } from './Pagination';
+
+const PAGE_SIZE = 5;
 
 interface WazuhPanelProps {
   events: AttackEvent[];
@@ -12,6 +15,7 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
   // came from a real forwarded Wazuh alert, not the synthetic generator,
   // decoy captures, or demo-button clicks.
   const wazuhEvents = events.filter((e) => e.source === 'wazuh');
+  const pg = usePagination(wazuhEvents, PAGE_SIZE);
 
   return (
     <div className="bg-slate-900/20 border border-slate-800 rounded-xl overflow-hidden relative flex flex-col h-[520px] shadow-sm">
@@ -40,8 +44,8 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
         <h3 className="text-[10px] font-bold uppercase text-slate-500 mb-3 border-b border-slate-800 pb-1">Recent Alerts</h3>
 
         <div className="flex flex-col gap-2">
-          {wazuhEvents.slice(0, 10).map((evt, idx) => (
-            <div key={idx} className="bg-slate-900/40 border border-slate-800 rounded-lg p-2.5 flex flex-col gap-1.5 hover:bg-slate-800/40 transition">
+          {pg.pageItems.map((evt, idx) => (
+            <div key={evt.id ?? pg.start + idx}className="bg-slate-900/40 border border-slate-800 rounded-lg p-2.5 flex flex-col gap-1.5 hover:bg-slate-800/40 transition">
               <div className="flex justify-between items-start gap-2">
                 <span className="text-red-400 text-[10px] font-bold">{evt.payload}</span>
                 <span className="text-[8px] text-slate-500 flex-shrink-0">{new Date(evt.timestamp).toLocaleTimeString()}</span>
@@ -57,6 +61,8 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
           )}
         </div>
       </div>
+
+      <Pagination page={pg.page} totalPages={pg.totalPages} total={pg.total} pageSize={pg.pageSize} onPageChange={pg.setPage} />
     </div>
   );
 }
