@@ -1,0 +1,58 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index 8b8e131..4eefc47 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -523,6 +523,10 @@ export default function App() {
+     setActiveAlerts((prev) => prev.filter((_, idx) => idx !== index));
+   };
+ 
++  const clearAllAlerts = () => {
++    setActiveAlerts([]);
++  };
++
+   const handleTabChange = (tab: TabId) => {
+     setActiveTab(tab);
+     if (tab === 'logs') queryLogs(1, logFilterProto);
+@@ -608,7 +612,7 @@ export default function App() {
+ 
+   return (
+     <div className="min-h-screen bg-slate-950 text-slate-200 font-mono p-4 md:p-6 flex flex-col gap-4 selection:bg-red-500 selection:text-white overflow-x-hidden">
+-      <AlertToasts alerts={activeAlerts} onClear={clearAlert} />
++      <AlertToasts alerts={activeAlerts} onClear={clearAlert} onClearAll={clearAllAlerts} />
+ 
+       <DashboardHeader sseStatus={sseStatus} />
+ 
+diff --git a/src/components/AlertToasts.tsx b/src/components/AlertToasts.tsx
+index 255498c..08fb061 100644
+--- a/src/components/AlertToasts.tsx
++++ b/src/components/AlertToasts.tsx
+@@ -1,15 +1,27 @@
+ import React from 'react';
+-import { ShieldAlert } from 'lucide-react';
++import { ShieldAlert, X } from 'lucide-react';
+ import { AttackEvent } from '../types';
+ 
+ interface AlertToastsProps {
+   alerts: AttackEvent[];
+   onClear: (index: number) => void;
++  onClearAll: () => void;
+ }
+ 
+-export default function AlertToasts({ alerts, onClear }: AlertToastsProps) {
++export default function AlertToasts({ alerts, onClear, onClearAll }: AlertToastsProps) {
+   return (
+     <div className="fixed top-4 right-4 z-[9999] space-y-2 pointer-events-auto max-w-sm w-full">
++      {alerts.length > 1 && (
++        <div className="flex justify-end">
++          <button
++            type="button"
++            onClick={onClearAll}
++            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-700 bg-slate-900/95 text-slate-400 hover:text-red-400 hover:border-red-900/50 text-[9px] font-mono font-bold uppercase tracking-widest shadow-lg backdrop-blur-md transition"
++          >
++            <X size={11} /> Clear all ({alerts.length})
++          </button>
++        </div>
++      )}
+       {alerts.map((alert, idx) => (
+         <div
+           key={`${alert.id}-${idx}`}

@@ -1,15 +1,27 @@
 import React from 'react';
-import { ShieldAlert } from 'lucide-react';
+import { ShieldAlert, X } from 'lucide-react';
 import { AttackEvent } from '../types';
 
 interface AlertToastsProps {
   alerts: AttackEvent[];
   onClear: (index: number) => void;
+  onClearAll: () => void;
 }
 
-export default function AlertToasts({ alerts, onClear }: AlertToastsProps) {
+export default function AlertToasts({ alerts, onClear, onClearAll }: AlertToastsProps) {
   return (
     <div className="fixed top-4 right-4 z-[9999] space-y-2 pointer-events-auto max-w-sm w-full">
+      {alerts.length > 1 && (
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={onClearAll}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-700 bg-slate-900/95 text-slate-400 hover:text-red-400 hover:border-red-900/50 text-[9px] font-mono font-bold uppercase tracking-widest shadow-lg backdrop-blur-md transition"
+          >
+            <X size={11} /> Clear all ({alerts.length})
+          </button>
+        </div>
+      )}
       {alerts.map((alert, idx) => (
         <div
           key={`${alert.id}-${idx}`}

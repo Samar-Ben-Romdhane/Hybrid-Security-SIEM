@@ -523,6 +523,10 @@ export default function App() {
     setActiveAlerts((prev) => prev.filter((_, idx) => idx !== index));
   };
 
+  const clearAllAlerts = () => {
+    setActiveAlerts([]);
+  };
+
   const handleTabChange = (tab: TabId) => {
     setActiveTab(tab);
     if (tab === 'logs') queryLogs(1, logFilterProto);
@@ -608,7 +612,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 font-mono p-4 md:p-6 flex flex-col gap-4 selection:bg-red-500 selection:text-white overflow-x-hidden">
-      <AlertToasts alerts={activeAlerts} onClear={clearAlert} />
+      <AlertToasts alerts={activeAlerts} onClear={clearAlert} onClearAll={clearAllAlerts} />
 
       <DashboardHeader sseStatus={sseStatus} />
 
