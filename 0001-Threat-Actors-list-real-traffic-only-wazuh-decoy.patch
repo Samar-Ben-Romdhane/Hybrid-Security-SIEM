@@ -1,0 +1,54 @@
+From 28e4fa3a1d98278bb56ccbc9e515d05cc7d4fc70 Mon Sep 17 00:00:00 2001
+From: Samar-Ben-Romdhane <samar8brm@gmail.com>
+Date: Sat, 10 Oct 2026 14:49:26 +0100
+Subject: [PATCH] Threat Actors: list real traffic only (wazuh + decoy)
+
+Filter /api/threats and the live SSE update to the wazuh and decoy
+sources, so synthetic generator, demo and manual-simulator events no
+longer appear as threat actors.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HJvEBwesC111sXUGMy3Dd9
+---
+ server.ts   | 7 ++++++-
+ src/App.tsx | 4 ++++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/server.ts b/server.ts
+index 027a981..d658177 100644
+--- a/server.ts
++++ b/server.ts
+@@ -744,9 +744,14 @@ app.get('/api/stats', (req, res) => {
+ });
+ 
+ // GET /api/threats - Group attackers by traffic and assign Threat levels
++// Only genuine traffic counts as a threat actor: forwarded Wazuh alerts and
++// honeypot decoy captures. The synthetic generator, demo clicks and the manual
++// simulator produce made-up IPs/countries and are excluded.
++const REAL_THREAT_SOURCES = new Set(['wazuh', 'decoy']);
++
+ app.get('/api/threats', (req, res) => {
+   const attackerMap: Record<string, { count: number; country: string; lastSeen: string }> = {};
+-  events.forEach(e => {
++  events.filter(e => REAL_THREAT_SOURCES.has(e.source || 'generator')).forEach(e => {
+     if (!attackerMap[e.ip]) {
+       attackerMap[e.ip] = { count: 0, country: e.country, lastSeen: e.timestamp };
+     } else {
+diff --git a/src/App.tsx b/src/App.tsx
+index 2f30778..4be3fb1 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -338,6 +338,10 @@ export default function App() {
+         // Push alarm is triggered if IP attempts exceed configuration threshold
+         // We track attempts of this IP
+         setThreatActors((prev) => {
++          // Threat Actors lists real traffic only (Wazuh alerts + honeypot decoys),
++          // mirroring REAL_THREAT_SOURCES in server.ts.
++          if (newEvent.source !== 'wazuh' && newEvent.source !== 'decoy') return prev;
++
+           const existing = prev.find(t => t.ip === newEvent.ip);
+           const currentCount = existing ? existing.count + 1 : 1;
+ 
+-- 
+2.43.0
+

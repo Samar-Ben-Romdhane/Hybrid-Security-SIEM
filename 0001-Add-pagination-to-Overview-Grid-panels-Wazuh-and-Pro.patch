@@ -1,0 +1,188 @@
+From 94353f440efcb413da39524c44f2fa607ae11129 Mon Sep 17 00:00:00 2001
+From: Samar-Ben-Romdhane <samar8brm@gmail.com>
+Date: Sat, 10 Oct 2026 12:37:19 +0100
+Subject: [PATCH] Add pagination to Overview Grid panels (Wazuh and Prowler)
+
+Add a shared Pagination component and usePagination hook, and use them
+in WazuhPanel and ProwlerPanel (5 items per page). Raise the Wazuh
+alert feed cap from 10 to 50 in App.tsx so there is more than one page.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HJvEBwesC111sXUGMy3Dd9
+---
+ src/App.tsx                     |  4 +--
+ src/components/Pagination.tsx   | 51 +++++++++++++++++++++++++++++++++
+ src/components/ProwlerPanel.tsx | 11 +++++--
+ src/components/WazuhPanel.tsx   | 10 +++++--
+ 4 files changed, 70 insertions(+), 6 deletions(-)
+ create mode 100644 src/components/Pagination.tsx
+
+diff --git a/src/App.tsx b/src/App.tsx
+index 5773b71..2f30778 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -141,7 +141,7 @@ export default function App() {
+   // Fetch static stats periodically, fallback SSE real-time events
+   const fetchWazuhRecentAlerts = async () => {
+     try {
+-      const res = await fetch('/api/events?source=wazuh&perPage=10');
++      const res = await fetch('/api/events?source=wazuh&perPage=50');
+       if (res.ok) {
+         const data = await res.json();
+         setWazuhRecentAlerts(data.events);
+@@ -311,7 +311,7 @@ export default function App() {
+         if (newEvent.source === 'wazuh') {
+           setWazuhRecentAlerts((prev) => {
+             if (prev.some(evt => evt.id === newEvent.id)) return prev;
+-            return [newEvent, ...prev].slice(0, 10);
++            return [newEvent, ...prev].slice(0, 50);
+           });
+         }
+ 
+diff --git a/src/components/Pagination.tsx b/src/components/Pagination.tsx
+new file mode 100644
+index 0000000..26947a9
+--- /dev/null
++++ b/src/components/Pagination.tsx
+@@ -0,0 +1,51 @@
++import React, { useState } from 'react';
++import { ChevronLeft, ChevronRight } from 'lucide-react';
++
++/**
++ * Client-side pagination state. The current page is clamped on every render,
++ * so it stays valid when the list shrinks (e.g. after a rescan or resync).
++ */
++export function usePagination<T>(items: T[], pageSize: number) {
++  const [page, setPage] = useState(1);
++  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
++  const safePage = Math.min(page, totalPages);
++  const start = (safePage - 1) * pageSize;
++  const pageItems = items.slice(start, start + pageSize);
++  return { page: safePage, setPage, totalPages, start, pageItems, total: items.length, pageSize };
++}
++
++interface PaginationProps {
++  page: number;
++  totalPages: number;
++  total: number;
++  pageSize: number;
++  onPageChange: (page: number) => void;
++}
++
++const btnClass =
++  'flex items-center gap-1 px-2.5 py-1 border border-slate-800 bg-slate-950 text-slate-400 hover:text-slate-200 hover:border-slate-700 disabled:opacity-30 disabled:cursor-not-allowed text-[8px] font-mono font-bold rounded-md transition uppercase tracking-widest';
++
++export default function Pagination({ page, totalPages, total, pageSize, onPageChange }: PaginationProps) {
++  if (total <= pageSize) return null;
++  const from = (page - 1) * pageSize + 1;
++  const to = Math.min(page * pageSize, total);
++
++  return (
++    <div className="border-t border-slate-800 bg-slate-950/60 px-3 py-2 flex items-center justify-between gap-2 font-mono">
++      <span className="text-[9px] text-slate-500 uppercase tracking-wider">
++        {from}-{to} of {total}
++      </span>
++      <div className="flex items-center gap-2">
++        <button type="button" className={btnClass} onClick={() => onPageChange(page - 1)} disabled={page <= 1}>
++          <ChevronLeft size={10} /> Prev
++        </button>
++        <span className="text-[9px] text-slate-400 uppercase tracking-wider">
++          {page} / {totalPages}
++        </span>
++        <button type="button" className={btnClass} onClick={() => onPageChange(page + 1)} disabled={page >= totalPages}>
++          Next <ChevronRight size={10} />
++        </button>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/components/ProwlerPanel.tsx b/src/components/ProwlerPanel.tsx
+index dd1385f..cdefa76 100644
+--- a/src/components/ProwlerPanel.tsx
++++ b/src/components/ProwlerPanel.tsx
+@@ -1,6 +1,9 @@
+ import React from 'react';
+ import { Globe } from 'lucide-react';
+ import { ProwlerMetrics, ProwlerFinding } from '../types';
++import Pagination, { usePagination } from './Pagination';
++
++const PAGE_SIZE = 5;
+ 
+ interface ProwlerPanelProps {
+   metrics: ProwlerMetrics;
+@@ -17,6 +20,8 @@ function severityBadgeClass(severity: string): string {
+ }
+ 
+ export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
++  const pg = usePagination(findings, PAGE_SIZE);
++
+   return (
+     <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[520px] shadow-sm">
+       <div className="bg-slate-900/80 p-3 border-b border-slate-800 flex justify-between items-center">
+@@ -58,10 +63,10 @@ export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
+                 </tr>
+               </thead>
+               <tbody className="text-[9px] text-slate-300">
+-                {findings.map((f, idx) => (
++                {pg.pageItems.map((f, idx) => (
+                   <tr
+                     key={f.id}
+-                    className={idx < findings.length - 1 ? 'border-b border-slate-800/50 hover:bg-slate-900/30' : 'hover:bg-slate-900/30'}
++                    className={idx < pg.pageItems.length - 1 ?'border-b border-slate-800/50 hover:bg-slate-900/30' : 'hover:bg-slate-900/30'}
+                   >
+                     <td className="p-2 truncate max-w-[140px]" title={f.check_title}>{f.resource_name}</td>
+                     <td className="p-2 font-bold">{f.port || '-'}</td>
+@@ -79,6 +84,8 @@ export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
+         )}
+ 
+       </div>
++
++      <Pagination page={pg.page} totalPages={pg.totalPages} total={pg.total} pageSize={pg.pageSize} onPageChange={pg.setPage} />
+     </div>
+   );
+ }
+diff --git a/src/components/WazuhPanel.tsx b/src/components/WazuhPanel.tsx
+index 0bfe647..9ebb1b2 100644
+--- a/src/components/WazuhPanel.tsx
++++ b/src/components/WazuhPanel.tsx
+@@ -1,6 +1,9 @@
+ import React from 'react';
+ import { Server } from 'lucide-react';
+ import { AttackEvent } from '../types';
++import Pagination, { usePagination } from './Pagination';
++
++const PAGE_SIZE = 5;
+ 
+ interface WazuhPanelProps {
+   events: AttackEvent[];
+@@ -12,6 +15,7 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
+   // came from a real forwarded Wazuh alert, not the synthetic generator,
+   // decoy captures, or demo-button clicks.
+   const wazuhEvents = events.filter((e) => e.source === 'wazuh');
++  const pg = usePagination(wazuhEvents, PAGE_SIZE);
+ 
+   return (
+     <div className="bg-slate-900/20 border border-slate-800 rounded-xl overflow-hidden relative flex flex-col h-[520px] shadow-sm">
+@@ -40,8 +44,8 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
+         <h3 className="text-[10px] font-bold uppercase text-slate-500 mb-3 border-b border-slate-800 pb-1">Recent Alerts</h3>
+ 
+         <div className="flex flex-col gap-2">
+-          {wazuhEvents.slice(0, 10).map((evt, idx) => (
+-            <div key={idx} className="bg-slate-900/40 border border-slate-800 rounded-lg p-2.5 flex flex-col gap-1.5 hover:bg-slate-800/40 transition">
++          {pg.pageItems.map((evt, idx) => (
++            <div key={evt.id ?? pg.start + idx}className="bg-slate-900/40 border border-slate-800 rounded-lg p-2.5 flex flex-col gap-1.5 hover:bg-slate-800/40 transition">
+               <div className="flex justify-between items-start gap-2">
+                 <span className="text-red-400 text-[10px] font-bold">{evt.payload}</span>
+                 <span className="text-[8px] text-slate-500 flex-shrink-0">{new Date(evt.timestamp).toLocaleTimeString()}</span>
+@@ -57,6 +61,8 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
+           )}
+         </div>
+       </div>
++
++      <Pagination page={pg.page} totalPages={pg.totalPages} total={pg.total} pageSize={pg.pageSize} onPageChange={pg.setPage} />
+     </div>
+   );
+ }
+-- 
+2.43.0
+

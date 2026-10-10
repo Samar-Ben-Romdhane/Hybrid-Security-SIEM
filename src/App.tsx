@@ -338,6 +338,10 @@ export default function App() {
         // Push alarm is triggered if IP attempts exceed configuration threshold
         // We track attempts of this IP
         setThreatActors((prev) => {
+          // Threat Actors lists real traffic only (Wazuh alerts + honeypot decoys),
+          // mirroring REAL_THREAT_SOURCES in server.ts.
+          if (newEvent.source !== 'wazuh' && newEvent.source !== 'decoy') return prev;
+
           const existing = prev.find(t => t.ip === newEvent.ip);
           const currentCount = existing ? existing.count + 1 : 1;
 

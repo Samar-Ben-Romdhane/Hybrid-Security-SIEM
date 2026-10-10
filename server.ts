@@ -744,9 +744,14 @@ app.get('/api/stats', (req, res) => {
 });
 
 // GET /api/threats - Group attackers by traffic and assign Threat levels
+// Only genuine traffic counts as a threat actor: forwarded Wazuh alerts and
+// honeypot decoy captures. The synthetic generator, demo clicks and the manual
+// simulator produce made-up IPs/countries and are excluded.
+const REAL_THREAT_SOURCES = new Set(['wazuh', 'decoy']);
+
 app.get('/api/threats', (req, res) => {
   const attackerMap: Record<string, { count: number; country: string; lastSeen: string }> = {};
-  events.forEach(e => {
+  events.filter(e => REAL_THREAT_SOURCES.has(e.source || 'generator')).forEach(e => {
     if (!attackerMap[e.ip]) {
       attackerMap[e.ip] = { count: 0, country: e.country, lastSeen: e.timestamp };
     } else {

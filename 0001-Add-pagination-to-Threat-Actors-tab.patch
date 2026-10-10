@@ -1,0 +1,98 @@
+From 3f09f3a4661aba61db0fe60c752e75da89d448e0 Mon Sep 17 00:00:00 2001
+From: Samar-Ben-Romdhane <samar8brm@gmail.com>
+Date: Fri, 9 Oct 2026 22:57:38 +0100
+Subject: [PATCH] Add pagination to Threat Actors tab
+
+Paginate the threat actors list client-side (10 per page) with
+Prev/Next controls, page indicator and range counter. Clamp the
+current page when the list shrinks after a sync.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HJvEBwesC111sXUGMy3Dd9
+---
+ src/components/ThreatsPanel.tsx | 49 +++++++++++++++++++++++++++++++--
+ 1 file changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/src/components/ThreatsPanel.tsx b/src/components/ThreatsPanel.tsx
+index 4c9689d..6b50c2c 100644
+--- a/src/components/ThreatsPanel.tsx
++++ b/src/components/ThreatsPanel.tsx
+@@ -1,7 +1,9 @@
+-import React from 'react';
+-import { RefreshCw } from 'lucide-react';
++import React, { useEffect, useState } from 'react';
++import { RefreshCw, ChevronLeft, ChevronRight } from 'lucide-react';
+ import { ThreatActor } from '../types';
+ 
++const PAGE_SIZE = 10;
++
+ interface ThreatsPanelProps {
+   threatActors: ThreatActor[];
+   onSync: () => void;
+@@ -9,6 +11,17 @@ interface ThreatsPanelProps {
+ }
+ 
+ export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: ThreatsPanelProps) {
++  const [page, setPage] = useState(1);
++  const totalPages = Math.max(1, Math.ceil(threatActors.length / PAGE_SIZE));
++
++  // Keep the current page valid when the list shrinks (e.g. after a sync)
++  useEffect(() => {
++    if (page > totalPages) setPage(totalPages);
++  }, [page, totalPages]);
++
++  const startIdx = (page - 1) * PAGE_SIZE;
++  const pageActors = threatActors.slice(startIdx, startIdx + PAGE_SIZE);
++
+   return (
+     <div className="space-y-4">
+ 
+@@ -34,7 +47,8 @@ export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: Threat
+             INTELLIGENCE DIRECTORY CURRENTLY STABLE. LAUNCH SIMULATIONS TO SCAN ASSETS.
+           </div>
+         ) : (
+-          threatActors.map((actor, idx) => {
++          pageActors.map((actor, i) => {
++            const idx = startIdx + i;
+             let badgeStyle = 'bg-slate-900 border-slate-800 text-slate-450';
+             if (actor.level === 'HIGH') {
+               badgeStyle = 'bg-red-950/60 border-red-900/30 text-red-400';
+@@ -78,6 +92,35 @@ export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: Threat
+           })
+         )}
+       </div>
++
++      {threatActors.length > PAGE_SIZE && (
++        <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-1">
++          <p className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">
++            Showing {startIdx + 1}-{Math.min(startIdx + PAGE_SIZE, threatActors.length)} of {threatActors.length} actors
++          </p>
++          <div className="flex items-center gap-2">
++            <button
++              type="button"
++              onClick={() => setPage((p) => Math.max(1, p - 1))}
++              disabled={page === 1}
++              className="flex items-center gap-1 px-3 py-1.5 border border-slate-850 bg-slate-950 text-slate-400 hover:text-slate-200 hover:border-slate-750 disabled:opacity-30 disabled:cursor-not-allowed text-[9px] font-mono font-bold rounded-lg transition uppercase tracking-widest"
++            >
++              <ChevronLeft size={11} /> Prev
++            </button>
++            <span className="text-[10px] font-mono text-slate-400 px-2 uppercase tracking-wider">
++              Page {page} / {totalPages}
++            </span>
++            <button
++              type="button"
++              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
++              disabled={page === totalPages}
++              className="flex items-center gap-1 px-3 py-1.5 border border-slate-850 bg-slate-950 text-slate-400 hover:text-slate-200 hover:border-slate-750 disabled:opacity-30 disabled:cursor-not-allowed text-[9px] font-mono font-bold rounded-lg transition uppercase tracking-widest"
++            >
++              Next <ChevronRight size={11} />
++            </button>
++          </div>
++        </div>
++      )}
+     </div>
+   );
+ }
+-- 
+2.43.0
+
