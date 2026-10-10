@@ -17,27 +17,7 @@ export default function SettingsPanel({ settings, soundEnabled, onUpdateSettings
         <h3 className="text-[10px] font-mono font-bold tracking-wider uppercase text-slate-300">Active Security Engine Profiling Controls</h3>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-        <div>
-          <label className="block text-[10px] font-mono text-slate-500 mb-1.5 uppercase font-bold tracking-wider">Traffic simulation frequency</label>
-          <div className="grid grid-cols-4 bg-slate-950 p-1 border border-slate-850 rounded-lg">
-            {(['off', 'slow', 'normal', 'fast'] as const).map((spd) => (
-              <button
-                key={spd}
-                onClick={() => onUpdateSettings({ simulationSpeed: spd })}
-                type="button"
-                className={`py-1.5 text-[9px] font-mono uppercase font-black rounded-md transition ${
-                  settings.simulationSpeed === spd
-                    ? 'bg-red-950/60 text-red-400 border border-red-900/30'
-                    : 'text-slate-500 hover:text-slate-350 hover:bg-slate-900/50'
-                }`}
-              >
-                {spd}
-              </button>
-            ))}
-          </div>
-        </div>
-
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
         <div>
           <label className="block text-[10px] font-mono text-slate-500 mb-1.5 uppercase font-bold tracking-wider">High threat threshold limit</label>
           <div className="flex items-center gap-3">
