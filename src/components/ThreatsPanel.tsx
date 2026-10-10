@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { RefreshCw, ChevronLeft, ChevronRight } from 'lucide-react';
 import { ThreatActor } from '../types';
+import { formatLocalDateTime } from '../utils/time';
 
 const PAGE_SIZE = 10;
 
@@ -77,7 +78,7 @@ export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: Threat
                 <div className="flex items-center gap-4 self-stretch sm:self-auto justify-between sm:justify-start">
                   <div className="text-left sm:text-right">
                     <p className="text-[8px] uppercase font-mono tracking-wider font-bold text-slate-500">Last Seen</p>
-                    <p className="text-[10px] font-mono font-medium text-slate-400">{new Date(actor.lastSeen).toISOString().replace('T', ' ').slice(0, 19)}</p>
+                    <p className="text-[10px] font-mono font-medium text-slate-400">{formatLocalDateTime(actor.lastSeen)}</p>
                   </div>
                   <button
                     onClick={() => onTraceIP(actor.ip)}

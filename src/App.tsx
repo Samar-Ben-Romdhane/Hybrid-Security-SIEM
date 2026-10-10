@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { AttackEvent, SecurityStats, ThreatActor, SystemSettings, ProwlerMetrics, ProwlerFinding } from './types';
 
 import AlertToasts from './components/AlertToasts';
+import { formatLocalDateTime } from './utils/time';
 import DashboardHeader from './components/DashboardHeader';
 import StatTiles from './components/StatTiles';
 import TabNav from './components/TabNav';
@@ -57,7 +58,7 @@ export default function App() {
   const [cloudScanStatus, setCloudScanStatus] = useState<'idle' | 'running' | 'done' | 'failed'>('idle');
   const [cloudScanError, setCloudScanError] = useState<string | null>(null);
   const cloudScanPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [timeStr, setTimeStr] = useState<string>(new Date().toISOString());
+  const [timeStr, setTimeStr] = useState<string>(formatLocalDateTime(new Date()));
 
   // Floating Warning Alerts Queue
   const [activeAlerts, setActiveAlerts] = useState<AttackEvent[]>([]);
@@ -111,7 +112,7 @@ export default function App() {
   // Update dynamic timestamp clock
   useEffect(() => {
     const timer = setInterval(() => {
-      setTimeStr(new Date().toUTCString());
+      setTimeStr(formatLocalDateTime(new Date()));
     }, 1000);
     return () => clearInterval(timer);
   }, []);

@@ -743,6 +743,37 @@ async function resolveDecoyGeo(ip: string): Promise<GeoResult> {
   return real ?? { country: 'Unknown', city: 'Unknown', lat: 0, lng: 0 };
 }
 
+// Work out which service a Wazuh alert is about from what the alert itself says,
+// instead of labelling everything SSH. Falls back to SSH/22 (the historical
+// default) when nothing in the alert points elsewhere.
+function detectWazuhService(alert: any): { protocol: 'SSH' | 'TELNET' | 'HTTP'; port: number } {
+  // 1. An explicit destination port is the most reliable signal.
+  const dstPort = Number(alert.data?.dstport ?? alert.data?.dst_port);
+  if (dstPort === 23) return { protocol: 'TELNET', port: 23 };
+  if (dstPort === 22) return { protocol: 'SSH', port: 22 };
+  if (dstPort === 80 || dstPort === 8080) return { protocol: 'HTTP', port: dstPort };
+
+  // 2. Otherwise look at the program / decoder / rule text and the raw log line.
+  const groups = Array.isArray(alert.rule?.groups) ? alert.rule.groups : [];
+  const text = [
+    alert.full_log,
+    alert.predecoder?.program_name,
+    alert.decoder?.name,
+    alert.rule?.description,
+    ...groups
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  if (/telnet/.test(text)) return { protocol: 'TELNET', port: 23 };
+  if (/\bssh\w*\b/.test(text)) return { protocol: 'SSH', port: 22 };
+  // login(1) failures that carry a remote host (rhost= / FROM <ip>) come from a
+  // remote login daemon such as telnetd spawned by inetd; local console logins
+  // have no remote host.
+  if (/login\[|pam_unix\(login/.test(text) && /rhost=\S+|from '?\d{1,3}(\.\d{1,3}){3}/.test(text)) {
+    return { protocol: 'TELNET', port: 23 };
+  }
+  return { protocol: 'SSH', port: 22 };
+}
+
 async function recordWazuhAlert(alert: any, source: AttackSource) {
   // A typical Wazuh alert has `rule`, `agent`, `location`, `data`
   const ruleId = alert.rule?.id || 'Unknown';
@@ -783,10 +814,12 @@ async function recordWazuhAlert(alert: any, source: AttackSource) {
     }
   }
 
+  const service = detectWazuhService(alert);
+
   return insertEvent({
     ip,
-    port: 22,
-    protocol: 'SSH', // Mocked as SSH for brute force context
+    port: service.port,
+    protocol: service.protocol,
     payload: `[Rule ${ruleId}] ${description}`,
     country,
     city,

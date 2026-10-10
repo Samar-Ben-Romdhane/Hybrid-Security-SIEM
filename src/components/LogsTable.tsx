@@ -1,6 +1,7 @@
 import React from 'react';
 import { Filter, ChevronLeft, ChevronRight } from 'lucide-react';
 import { AttackEvent } from '../types';
+import { formatLocalDateTime } from '../utils/time';
 
 interface LogsTableProps {
   logs: AttackEvent[];
@@ -91,7 +92,7 @@ export default function LogsTable({
                   return (
                     <tr key={`${log.id}-${idx}`} className="hover:bg-slate-900/30 transition-colors">
                       <td className="p-4 text-slate-500">
-                        {new Date(log.timestamp).toISOString().replace('T', ' ').substring(0, 19)}
+                        {formatLocalDateTime(log.timestamp)}
                       </td>
                       <td className="p-4 font-black text-red-400 hover:underline cursor-pointer" onClick={() => onFocusMap(log)}>
                         {log.ip}
