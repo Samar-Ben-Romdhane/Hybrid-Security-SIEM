@@ -1,6 +1,8 @@
-import React from 'react';
-import { RefreshCw } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { RefreshCw, ChevronLeft, ChevronRight } from 'lucide-react';
 import { ThreatActor } from '../types';
+
+const PAGE_SIZE = 10;
 
 interface ThreatsPanelProps {
   threatActors: ThreatActor[];
@@ -9,6 +11,17 @@ interface ThreatsPanelProps {
 }
 
 export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: ThreatsPanelProps) {
+  const [page, setPage] = useState(1);
+  const totalPages = Math.max(1, Math.ceil(threatActors.length / PAGE_SIZE));
+
+  // Keep the current page valid when the list shrinks (e.g. after a sync)
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+
+  const startIdx = (page - 1) * PAGE_SIZE;
+  const pageActors = threatActors.slice(startIdx, startIdx + PAGE_SIZE);
+
   return (
     <div className="space-y-4">
 
@@ -34,7 +47,8 @@ export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: Threat
             INTELLIGENCE DIRECTORY CURRENTLY STABLE. LAUNCH SIMULATIONS TO SCAN ASSETS.
           </div>
         ) : (
-          threatActors.map((actor, idx) => {
+          pageActors.map((actor, i) => {
+            const idx = startIdx + i;
             let badgeStyle = 'bg-slate-900 border-slate-800 text-slate-450';
             if (actor.level === 'HIGH') {
               badgeStyle = 'bg-red-950/60 border-red-900/30 text-red-400';
@@ -78,6 +92,35 @@ export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: Threat
           })
         )}
       </div>
+
+      {threatActors.length > PAGE_SIZE && (
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-1">
+          <p className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">
+            Showing {startIdx + 1}-{Math.min(startIdx + PAGE_SIZE, threatActors.length)} of {threatActors.length} actors
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page === 1}
+              className="flex items-center gap-1 px-3 py-1.5 border border-slate-850 bg-slate-950 text-slate-400 hover:text-slate-200 hover:border-slate-750 disabled:opacity-30 disabled:cursor-not-allowed text-[9px] font-mono font-bold rounded-lg transition uppercase tracking-widest"
+            >
+              <ChevronLeft size={11} /> Prev
+            </button>
+            <span className="text-[10px] font-mono text-slate-400 px-2 uppercase tracking-wider">
+              Page {page} / {totalPages}
+            </span>
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={page === totalPages}
+              className="flex items-center gap-1 px-3 py-1.5 border border-slate-850 bg-slate-950 text-slate-400 hover:text-slate-200 hover:border-slate-750 disabled:opacity-30 disabled:cursor-not-allowed text-[9px] font-mono font-bold rounded-lg transition uppercase tracking-widest"
+            >
+              Next <ChevronRight size={11} />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
