@@ -473,8 +473,7 @@ function startHoneypotListeners() {
       socket.on('data', (data) => {
         const payloadStr = data.toString('utf-8', 0, 200).trim().replace(/[\r\n]+/g, ' ');
         // Resolve geo and write to DB
-        const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-        insertEvent({
+        resolveDecoyGeo(clientIP).then(loc => insertEvent({
           ip: clientIP,
           port: 2222,
           protocol: 'SSH',
@@ -484,7 +483,7 @@ function startHoneypotListeners() {
           lat: loc.lat,
           lng: loc.lng,
           source: 'decoy'
-        }).catch(err => console.error('SSH insertEvent failed:', err));
+        })).catch(err => console.error('SSH insertEvent failed:', err));
         socket.end();
       });
 
@@ -522,8 +521,7 @@ function startHoneypotListeners() {
           const password = input;
           socket.write('Login incorrect\r\n');
 
-          const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-          insertEvent({
+          resolveDecoyGeo(clientIP).then(loc => insertEvent({
             ip: clientIP,
             port: 2323,
             protocol: 'TELNET',
@@ -533,7 +531,7 @@ function startHoneypotListeners() {
             lat: loc.lat,
             lng: loc.lng,
             source: 'decoy'
-          }).catch(err => console.error('Telnet insertEvent failed:', err));
+          })).catch(err => console.error('Telnet insertEvent failed:', err));
           socket.end();
         }
       });
@@ -559,8 +557,7 @@ function startHoneypotListeners() {
       const reqPath = req.url || '/';
       const userAgent = req.headers['user-agent'] || 'Unknown';
 
-      const loc = LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)];
-      insertEvent({
+      resolveDecoyGeo(clientIP).then(loc => insertEvent({
         ip: clientIP,
         port: 8080,
         protocol: 'HTTP',
@@ -570,7 +567,7 @@ function startHoneypotListeners() {
         lat: loc.lat,
         lng: loc.lng,
         source: 'decoy'
-      }).catch(err => console.error('HTTP decoy insertEvent failed:', err));
+      })).catch(err => console.error('HTTP decoy insertEvent failed:', err));
 
       res.writeHead(401, {
         'Content-Type': 'text/html',
@@ -619,8 +616,14 @@ app.get('/api/events', (req, res) => {
   const perPage = parseInt(req.query.perPage as string) || 30;
   const filterProtocol = req.query.protocol as string;
   const filterSource = req.query.source as string;
+  // ?real=1 restricts to genuine traffic (wazuh + decoy), dropping synthetic
+  // generator/demo/manual events. Used by the Telemetry Logs tab.
+  const realOnly = req.query.real === '1';
 
   let filtered = [...events];
+  if (realOnly) {
+    filtered = filtered.filter(e => REAL_THREAT_SOURCES.has(e.source || 'generator'));
+  }
   if (filterProtocol) {
     filtered = filtered.filter(e => e.protocol === filterProtocol);
   }
@@ -862,6 +865,15 @@ async function lookupRealGeoIP(ip: string): Promise<GeoResult | null> {
   } catch {
     return null;
   }
+}
+
+// Geolocation for honeypot decoy captures. Same honest handling as Wazuh
+// alerts: private ranges are labeled as such, public IPs get a real lookup,
+// and a failed lookup yields "Unknown" rather than a random fake location.
+async function resolveDecoyGeo(ip: string): Promise<GeoResult> {
+  if (isPrivateOrLocalIP(ip)) return { country: 'Local Network', city: 'Private Range', lat: 0, lng: 0 };
+  const real = await lookupRealGeoIP(ip);
+  return real ?? { country: 'Unknown', city: 'Unknown', lat: 0, lng: 0 };
 }
 
 async function recordWazuhAlert(alert: any, source: AttackSource) {

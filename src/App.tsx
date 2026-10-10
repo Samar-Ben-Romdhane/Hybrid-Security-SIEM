@@ -182,7 +182,7 @@ export default function App() {
   // Fetch paginated events log
   const queryLogs = async (page = 1, proto = logFilterProto) => {
     try {
-      let url = `/api/events?page=${page}&perPage=12`;
+      let url = `/api/events?page=${page}&perPage=12&real=1`;
       if (proto !== 'ALL') {
         url += `&protocol=${proto}`;
       }
@@ -574,6 +574,9 @@ export default function App() {
 
   // Filter local state ticker on logs
   const filteredSearchLogs = events.filter(e => {
+    // Telemetry Logs shows real traffic only (Wazuh alerts + honeypot decoys),
+    // also for events pushed live over SSE. Mirrors REAL_THREAT_SOURCES in server.ts.
+    if (e.source !== 'wazuh' && e.source !== 'decoy') return false;
     if (!logSearchQuery) return true;
     const query = logSearchQuery.toLowerCase();
     return (
