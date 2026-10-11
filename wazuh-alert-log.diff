@@ -1,0 +1,15 @@
+diff --git a/server.ts b/server.ts
+index 2a11498..c17a4de 100644
+--- a/server.ts
++++ b/server.ts
+@@ -815,6 +815,10 @@ async function recordWazuhAlert(alert: any, source: AttackSource) {
+   }
+ 
+   const service = detectWazuhService(alert);
++  console.log(
++    `Wazuh alert rule=${ruleId} src=${ip} -> ${service.protocol}/${service.port} ` +
++    `(full_log ${alert.full_log ? 'present' : 'MISSING'}, fields: ${Object.keys(alert).join(',') || 'none'})`
++  );
+ 
+   return insertEvent({
+     ip,

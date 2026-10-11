@@ -815,6 +815,10 @@ async function recordWazuhAlert(alert: any, source: AttackSource) {
   }
 
   const service = detectWazuhService(alert);
+  console.log(
+    `Wazuh alert rule=${ruleId} src=${ip} -> ${service.protocol}/${service.port} ` +
+    `(full_log ${alert.full_log ? 'present' : 'MISSING'}, fields: ${Object.keys(alert).join(',') || 'none'})`
+  );
 
   return insertEvent({
     ip,
@@ -830,8 +834,21 @@ async function recordWazuhAlert(alert: any, source: AttackSource) {
 }
 
 // POST /api/wazuh/webhook - Ingest Wazuh alerts (external integration - API key protected)
+// Wazuh's Vulnerability Detector emits one alert per CVE per package (rules
+// 235xx), hundreds per scan. Those are inventory findings, not live attacks, and
+// they would flood the feed, evict real events from the 1000-row cap and trip
+// the per-IP threat alarm. They are acknowledged but not recorded.
+function isVulnerabilityDetectorAlert(alert: any): boolean {
+  const groups = Array.isArray(alert?.rule?.groups) ? alert.rule.groups : [];
+  const id = Number(alert?.rule?.id);
+  return groups.includes('vulnerability-detector') || (id >= 23500 && id <= 23599);
+}
+
 app.post('/api/wazuh/webhook', wazuhAuth, async (req, res) => {
   try {
+    if (isVulnerabilityDetectorAlert(req.body)) {
+      return res.json({ status: 'ignored', reason: 'vulnerability-detector alert' });
+    }
     const logged = await recordWazuhAlert(req.body || {}, 'wazuh');
     res.json({
       status: 'success',

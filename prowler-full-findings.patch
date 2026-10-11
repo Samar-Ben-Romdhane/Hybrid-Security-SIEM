@@ -1,0 +1,901 @@
+diff --git a/.gitignore b/.gitignore
+index b9a2039..6f875aa 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,3 +10,6 @@ coverage/
+ # esbuild output from `npm run dev` (npm run build writes to dist/ instead, already ignored above)
+ /server.cjs
+ /server.cjs.map
++
++# Patch files shared during development - apply them, never commit them
++*.patch
+diff --git a/server.ts b/server.ts
+index 027a981..baaa3cb 100644
+--- a/server.ts
++++ b/server.ts
+@@ -14,7 +14,12 @@ dotenv.config();
+ const app = express();
+ const PORT = Number(process.env.PORT) || 3000;
+ 
+-app.use(express.json());
++// Whole Prowler scan files (thousands of findings) are far larger than the default
++// 100kb JSON limit, so that one route gets a bigger limit - but it is parsed only AFTER
++// the bearer-token check, so an unauthenticated caller can't make us buffer a huge body.
++const jsonParser = express.json();
++const prowlerUploadParser = express.json({ limit: '50mb' });
++app.use((req, res, next) => (req.path === '/api/prowler/upload' ? next() : jsonParser(req, res, next)));
+ 
+ // --- Postgres connection pool ---
+ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+@@ -156,6 +161,30 @@ async function initSchema() {
+       scanned_at TIMESTAMPTZ NOT NULL
+     );
+   `);
++
++  // Every finding from the latest Prowler scan (pass AND fail), with full detail.
++  await pool.query(`
++    CREATE TABLE IF NOT EXISTS prowler_scan_findings (
++      id SERIAL PRIMARY KEY,
++      status TEXT NOT NULL,
++      severity TEXT NOT NULL,
++      check_id TEXT NOT NULL,
++      check_title TEXT NOT NULL,
++      service TEXT NOT NULL,
++      resource_name TEXT NOT NULL,
++      resource_uid TEXT,
++      resource_type TEXT,
++      region TEXT,
++      account TEXT,
++      detail TEXT,
++      description TEXT,
++      risk TEXT,
++      remediation TEXT,
++      remediation_url TEXT,
++      compliance JSONB,
++      scanned_at TIMESTAMPTZ NOT NULL
++    );
++  `);
+ }
+ 
+ function rowToEvent(row: any): AttackEvent {
+@@ -316,9 +345,21 @@ const PORT_KEYWORDS: Record<string, string> = {
+   http: '80', https: '443', ftp: '21', telnet: '23', smb: '445', redis: '6379'
+ };
+ 
+-function extractPort(text: string): string {
++// The check ID is the most reliable signal (it can't be polluted by an NSG or
++// subscription that happens to be named "ssh-something"), so use it first and
++// only fall back to scanning the free-text message.
++const CHECK_ID_PORTS: Array<[string, string]> = [
++  ['_ssh_', '22'], ['_rdp_', '3389'], ['_https_', '443'], ['_http_', '80'], ['_udp_', 'UDP']
++];
++
++function extractPort(text: string, checkId: string = ''): string {
++  const id = checkId.toLowerCase();
++  for (const [needle, port] of CHECK_ID_PORTS) {
++    if (id.includes(needle)) return port;
++  }
+   const explicit = text.match(/port\s+(\d{1,5})/i) || text.match(/:(\d{1,5})\b/);
+   if (explicit) return explicit[1];
++  if (id) return '-'; // known check with no port meaning: don't guess from names in the text
+   const lower = text.toLowerCase();
+   for (const [keyword, port] of Object.entries(PORT_KEYWORDS)) {
+     if (lower.includes(keyword)) return port;
+@@ -326,7 +367,9 @@ function extractPort(text: string): string {
+   return '-';
+ }
+ 
+-function extractSource(text: string): string {
++function extractSource(text: string, checkId: string = ''): string {
++  // A FAIL on an *_internet_access_restricted check means the NSG allows it from the Internet.
++  if (/internet_access_restricted/i.test(checkId)) return 'Internet';
+   const cidr = text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}\b/);
+   if (cidr) return cidr[0];
+   if (/\binternet\b/i.test(text) || /\bany\b/i.test(text)) return '0.0.0.0/0';
+@@ -344,13 +387,15 @@ async function replaceProwlerFindings(rawFailedChecks: any[]): Promise<ProwlerFi
+     const severity: string = check.severity || check.Severity || check.finding_info?.severity || 'Unknown';
+     const detail: string = check.status_detail || check.message || check.StatusExtended || '';
+ 
++    const checkId: string = String(check.metadata?.event_code || check.CheckID || '');
++
+     return {
+       check_title: String(checkTitle).slice(0, 300),
+       resource_name: String(resourceName).slice(0, 200),
+       severity: String(severity).slice(0, 50),
+       detail: String(detail).slice(0, 500),
+-      port: extractPort(detail),
+-      source: extractSource(detail),
++      port: extractPort(detail, checkId),
++      source: extractSource(detail, checkId),
+       scanned_at: scannedAt
+     };
+   });
+@@ -942,72 +987,145 @@ app.post('/api/demo/wazuh-alert', async (req, res) => {
+   }
+ });
+ 
+-// Shared logic for turning raw Prowler JSON output into compliance metrics and
+-// persisting them, used by both the protected external upload route and the
+-// unauthenticated in-dashboard demo trigger below.
++// ---- Prowler: helpers shared by the summary metrics and the full findings view ----
++const isProwlerFail = (check: any): boolean =>
++  check.Status === 'FAIL' || check.status === 'Fail' || check.status_code === 'FAIL' || check.finding_info?.status === 'Fail';
++const isProwlerPass = (check: any): boolean =>
++  check.Status === 'PASS' || check.status === 'Pass' || check.status_code === 'PASS' || check.finding_info?.status === 'Pass';
++
++interface NormalizedProwlerFinding {
++  status: string; severity: string; check_id: string; check_title: string; service: string;
++  resource_name: string; resource_uid: string; resource_type: string; region: string; account: string;
++  detail: string; description: string; risk: string; remediation: string; remediation_url: string;
++  compliance: Record<string, unknown> | null;
++}
++
++const firstText = (...values: any[]): string => {
++  for (const v of values) {
++    if (typeof v === 'string' && v.trim() !== '') return v.trim();
++  }
++  return '';
++};
++const clip = (text: string, max = 4000): string => (text.length > max ? text.slice(0, max) + '…' : text);
++
++// Maps one raw Prowler finding (current OCSF output, or the legacy V3 native JSON)
++// onto the flat shape the dashboard stores. Field names follow Prowler's own OCSF writer:
++//   metadata.event_code = check ID          finding_info.title / .desc = check title / description
++//   status_code = PASS|FAIL                 status_detail (= message) = the specific result text
++//   risk_details = risk                     remediation.desc / .references = how to fix it
++//   resources[0].{name,uid,type,region,group.name = service}     cloud.account = subscription
++function normalizeProwlerFinding(check: any): NormalizedProwlerFinding {
++  const res = Array.isArray(check.resources) ? check.resources[0] : undefined;
++  const checkId = firstText(check.metadata?.event_code, check.CheckID, check.check_id);
++  const severity = firstText(check.severity, check.Severity).toLowerCase();
++  const compliance = check.unmapped?.compliance ?? check.Compliance;
++
++  let status = 'UNKNOWN';
++  if (isProwlerFail(check)) status = 'FAIL';
++  else if (isProwlerPass(check)) status = 'PASS';
++  else if ([check.status_code, check.Status].some((v) => String(v).toUpperCase() === 'MANUAL')) status = 'MANUAL';
++
++  return {
++    status,
++    severity: severity ? severity.charAt(0).toUpperCase() + severity.slice(1) : 'Unknown',
++    check_id: checkId || 'unknown',
++    check_title: clip(firstText(check.finding_info?.title, check.CheckTitle, checkId, 'Unknown check'), 500),
++    service: firstText(res?.group?.name, check.ServiceName, 'unknown').toLowerCase(),
++    resource_name: clip(firstText(res?.name, check.ResourceName, res?.uid, check.ResourceId, '-'), 500),
++    resource_uid: clip(firstText(res?.uid, check.ResourceId), 1000),
++    resource_type: clip(firstText(res?.type, check.ResourceType), 300),
++    region: firstText(res?.region, check.cloud?.region, check.Region),
++    account: clip(firstText(check.cloud?.account?.name, check.cloud?.account?.uid, check.AccountId), 300),
++    detail: clip(firstText(check.status_detail, check.message, check.StatusExtended)),
++    description: clip(firstText(check.finding_info?.desc, check.Description)),
++    risk: clip(firstText(check.risk_details, check.Risk)),
++    remediation: clip(firstText(check.remediation?.desc, check.Remediation?.Recommendation?.Text)),
++    remediation_url: clip(firstText(
++      Array.isArray(check.remediation?.references) ? check.remediation.references[0] : '',
++      check.Remediation?.Recommendation?.Url,
++      check.unmapped?.related_url
++    ), 1000),
++    compliance: compliance && typeof compliance === 'object' ? compliance : null
++  };
++}
++
++// Each scan is a point-in-time snapshot: replace the previous one atomically.
++async function replaceAllProwlerFindings(findings: NormalizedProwlerFinding[]) {
++  const rows = findings.slice(0, 20000);
++  const scannedAt = new Date().toISOString();
++  const COLS = 17;
++  const client = await pool.connect();
++  try {
++    await client.query('BEGIN');
++    await client.query('DELETE FROM prowler_scan_findings');
++    for (let i = 0; i < rows.length; i += 200) {
++      const params: any[] = [];
++      const tuples = rows.slice(i, i + 200).map((r, idx) => {
++        params.push(r.status, r.severity, r.check_id, r.check_title, r.service, r.resource_name, r.resource_uid,
++          r.resource_type, r.region, r.account, r.detail, r.description, r.risk, r.remediation, r.remediation_url,
++          r.compliance ? JSON.stringify(r.compliance) : null, scannedAt);
++        const base = idx * COLS;
++        return '(' + Array.from({ length: COLS }, (_, k) => `$${base + k + 1}`).join(',') + ')';
++      });
++      await client.query(
++        `INSERT INTO prowler_scan_findings (status, severity, check_id, check_title, service, resource_name,
++           resource_uid, resource_type, region, account, detail, description, risk, remediation, remediation_url,
++           compliance, scanned_at) VALUES ${tuples.join(',')}`,
++        params
++      );
++    }
++    await client.query('COMMIT');
++  } catch (err) {
++    await client.query('ROLLBACK');
++    throw err;
++  } finally {
++    client.release();
++  }
++}
++
++// Shared logic for turning raw Prowler JSON output into compliance metrics + stored findings,
++// used by the protected upload route, the demo trigger, and the on-demand Azure scan.
+ async function processProwlerUpload(prowlerData: unknown) {
+   if (!Array.isArray(prowlerData)) {
+     throw Object.assign(new Error('Expected an array of Prowler JSON results'), { statusCode: 400 });
+   }
++  const items = prowlerData.filter((c) => c && typeof c === 'object');
+ 
+-  // Handle the legacy Prowler V3 native JSON format and the current OCSF v1.1.0
+-  // format (default output since Prowler v4). Field mapping per Prowler's own
+-  // v3 -> OCSF migration table:
+-  //   CheckID -> metadata.event_code | ServiceName -> resources[].group.name
+-  //   ResourceType -> resources[].type | Status -> status_code
++  // Real Azure NSG checks in Prowler are named network_{ssh,rdp,http,https,tcp,udp}_internet_access_restricted
++  // (plus network_subnet_nsg_associated) and report on microsoft.network/networksecuritygroups.
++  // Other checks in the "network" service (Bastion, flow logs, DDoS, Network Watcher, Shodan)
++  // are NOT NSG rule findings, so matching on the service name alone would be far too broad.
++  const NSG_CHECK_ID = /^network_(ssh|rdp|http|https|tcp|udp)_internet_access_restricted$|nsg|security_group/;
+   const isNsgCheck = (check: any): boolean => {
+-    // Legacy V3 native JSON
+-    if (check.ServiceName === 'virtualnetwork' && check.ResourceType === 'networksecuritygroups') return true;
+-    if (typeof check.CheckID === 'string' && check.CheckID.toLowerCase().includes('security_group')) return true;
+-
+-    // Current OCSF v1.1.0 (default since Prowler v4/v5)
+-    const eventCode: string = check.metadata?.event_code || '';
+-    if (eventCode.toLowerCase().includes('security_group')) return true;
+-
+-    const resources: any[] = Array.isArray(check.resources) ? check.resources : [];
+-    return resources.some((r) =>
+-      r?.group?.name?.toLowerCase?.().includes('network') ||
+-      r?.type?.toLowerCase?.().includes('networksecuritygroup')
+-    );
++    const checkId = String(check.metadata?.event_code || check.CheckID || '').toLowerCase();
++    if (NSG_CHECK_ID.test(checkId)) return true;
++
++    const resourceTypes: string[] = [
++      check.ResourceType,
++      ...(Array.isArray(check.resources) ? check.resources.map((r: any) => r?.type) : [])
++    ].filter(Boolean).map((t) => String(t).toLowerCase());
++    return resourceTypes.some((t) => t.includes('networksecuritygroup'));
+   };
+ 
+-  const isFail = (check: any): boolean =>
+-    check.Status === 'FAIL' || check.status === 'Fail' || check.status_code === 'FAIL' || check.finding_info?.status === 'Fail';
+-  const isPass = (check: any): boolean =>
+-    check.Status === 'PASS' || check.status === 'Pass' || check.status_code === 'PASS' || check.finding_info?.status === 'Pass';
+-
+-  const nsgChecks = prowlerData.filter(isNsgCheck);
++  const nsgChecks = items.filter(isNsgCheck);
+ 
+-  // Status extraction depends on the specific JSON output format used (V3 vs OCSF)
+-  let fails = 0;
+-  let passes = 0;
+-
+-  let failedChecks: any[];
+-  if (nsgChecks.length > 0) {
+-    failedChecks = nsgChecks.filter(isFail);
+-    fails = failedChecks.length;
+-    passes = nsgChecks.filter(isPass).length;
+-  } else {
+-    // If no specific NSG checks found, just sum overall passes/fails for the PoC
+-    failedChecks = prowlerData.filter(isFail);
+-    fails = failedChecks.length;
+-    passes = prowlerData.filter(isPass).length;
+-  }
++  // Headline pass/fail numbers cover the WHOLE scan, so they always agree with the
++  // Cloud Findings tab. The NSG panel is the NSG-only subset of the failures.
++  const fails = items.filter(isProwlerFail).length;
++  const passes = items.filter(isProwlerPass).length;
+ 
+-  // Persist the real per-finding detail behind the aggregate counts, so the
+-  // dashboard's violations table can show actual scan results instead of
+-  // static sample rows.
+-  await replaceProwlerFindings(failedChecks);
++  await replaceProwlerFindings(nsgChecks.filter(isProwlerFail));
++  await replaceAllProwlerFindings(items.map(normalizeProwlerFinding));
+ 
+   return upsertProwlerMetrics({
+-    total_nsg_checks: nsgChecks.length > 0 ? nsgChecks.length : prowlerData.length,
++    total_nsg_checks: nsgChecks.length,
+     fails,
+     passes
+   });
+ }
+ 
+ // POST /api/prowler/upload - Ingest Prowler JSON output (external integration - API key protected)
+-app.post('/api/prowler/upload', prowlerAuth, async (req, res) => {
++app.post('/api/prowler/upload', prowlerAuth, prowlerUploadParser, async (req, res) => {
+   try {
+     const metrics = await processProwlerUpload(req.body);
+     res.json({ status: 'success', metrics });
+@@ -1050,6 +1168,61 @@ app.get('/api/prowler/findings', (req, res) => {
+   res.json(latestProwlerFindings);
+ });
+ 
++// GET /api/prowler/all-findings - Every finding from the latest scan, filterable + paginated.
++// Query: status, severity, service, q (free text), page, perPage (max 100)
++app.get('/api/prowler/all-findings', async (req, res) => {
++  try {
++    const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
++    const page = Math.max(1, parseInt(str(req.query.page)) || 1);
++    const perPage = Math.min(100, Math.max(1, parseInt(str(req.query.perPage)) || 25));
++
++    const where: string[] = [];
++    const params: any[] = [];
++    const addFilter = (sql: string, value: string) => {
++      params.push(value);
++      where.push(sql.replace('?', `$${params.length}`));
++    };
++    if (str(req.query.status)) addFilter('status = ?', str(req.query.status).toUpperCase());
++    if (str(req.query.severity)) addFilter('LOWER(severity) = ?', str(req.query.severity).toLowerCase());
++    if (str(req.query.service)) addFilter('service = ?', str(req.query.service).toLowerCase());
++    if (str(req.query.q)) {
++      const like = '%' + str(req.query.q).replace(/[\\%_]/g, '\\$&') + '%';
++      params.push(like);
++      const n = params.length;
++      where.push(`(check_title ILIKE $${n} OR check_id ILIKE $${n} OR resource_name ILIKE $${n}
++        OR resource_uid ILIKE $${n} OR detail ILIKE $${n} OR region ILIKE $${n})`);
++    }
++    const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
++
++    const total = (await pool.query(`SELECT COUNT(*)::int AS n FROM prowler_scan_findings ${whereSql}`, params)).rows[0].n;
++    const rows = (await pool.query(
++      `SELECT * FROM prowler_scan_findings ${whereSql}
++       ORDER BY (status = 'FAIL') DESC,
++         CASE LOWER(severity) WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
++         service, check_id, resource_name
++       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
++      [...params, perPage, (page - 1) * perPage]
++    )).rows;
++
++    // Facet counts always describe the whole scan, so the filter chips don't jump around.
++    const facet = async (column: string) => {
++      const r = await pool.query(`SELECT ${column} AS k, COUNT(*)::int AS n FROM prowler_scan_findings GROUP BY ${column} ORDER BY n DESC`);
++      return Object.fromEntries(r.rows.map((x: any) => [x.k, x.n]));
++    };
++
++    res.json({
++      findings: rows.map((r: any) => ({ ...r, scanned_at: new Date(r.scanned_at).toISOString() })),
++      total,
++      page,
++      pages: Math.max(1, Math.ceil(total / perPage)),
++      facets: { status: await facet('status'), severity: await facet('severity'), service: await facet('service') }
++    });
++  } catch (err) {
++    console.error('GET /api/prowler/all-findings failed:', err);
++    res.status(500).json({ error: 'Failed to load findings' });
++  }
++});
++
+ // --- Real on-demand Prowler scan against the actual Azure environment ---
+ // Uses a Service Principal (--sp-env-auth) since interactive az-cli/browser
+ // login isn't available from a server-side button click.
+diff --git a/src/App.tsx b/src/App.tsx
+index 5773b71..8a219c2 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -7,6 +7,7 @@ import StatTiles from './components/StatTiles';
+ import TabNav from './components/TabNav';
+ import WazuhPanel from './components/WazuhPanel';
+ import ProwlerPanel from './components/ProwlerPanel';
++import ProwlerFindingsTable from './components/ProwlerFindingsTable';
+ import ChartsPanel from './components/ChartsPanel';
+ import SettingsPanel from './components/SettingsPanel';
+ import LogsTable from './components/LogsTable';
+@@ -14,7 +15,7 @@ import ThreatsPanel from './components/ThreatsPanel';
+ import SimulatorPanel from './components/SimulatorPanel';
+ import Footer from './components/Footer';
+ 
+-type TabId = 'dashboard' | 'logs' | 'threats' | 'simulator';
++type TabId = 'dashboard' | 'logs' | 'threats' | 'findings' | 'simulator';
+ 
+ export default function App() {
+   // Main Telemetry States
+@@ -605,7 +606,7 @@ export default function App() {
+ 
+       <DashboardHeader sseStatus={sseStatus} />
+ 
+-      <StatTiles stats={stats} prowlerMetrics={prowlerMetrics} />
++      <StatTiles stats={stats} prowlerMetrics={prowlerMetrics} nsgViolations={prowlerFindings.length} />
+ 
+       <TabNav activeTab={activeTab} onTabChange={handleTabChange} />
+ 
+@@ -617,7 +618,7 @@ export default function App() {
+           <div className="space-y-4">
+             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+               <WazuhPanel events={wazuhRecentAlerts} timeStr={timeStr} />
+-              <ProwlerPanel metrics={prowlerMetrics} findings={prowlerFindings} />
++              <ProwlerPanel metrics={prowlerMetrics} findings={prowlerFindings} onViewAll={() => setActiveTab('findings')} />
+             </div>
+ 
+             <ChartsPanel
+@@ -663,6 +664,11 @@ export default function App() {
+           <ThreatsPanel threatActors={threatActors} onSync={syncTelemetry} onTraceIP={handleTraceIP} />
+         )}
+ 
++        {/* TAB: EVERY PROWLER FINDING, WITH FULL DETAIL */}
++        {activeTab === 'findings' && (
++          <ProwlerFindingsTable refreshKey={prowlerMetrics.updated_at} />
++        )}
++
+         {/* TAB 4: DIRECT DECOY ATTACK SIMULATOR */}
+         {activeTab === 'simulator' && (
+           <SimulatorPanel
+diff --git a/src/components/ProwlerFindingsTable.tsx b/src/components/ProwlerFindingsTable.tsx
+new file mode 100644
+index 0000000..600fb8d
+--- /dev/null
++++ b/src/components/ProwlerFindingsTable.tsx
+@@ -0,0 +1,336 @@
++import React, { useEffect, useState } from 'react';
++import { ChevronLeft, ChevronRight, ChevronDown, Search, ExternalLink } from 'lucide-react';
++import { ProwlerFindingsPage, ProwlerScanFinding } from '../types';
++
++interface ProwlerFindingsTableProps {
++  // Changes whenever a new scan is uploaded, which triggers a reload.
++  refreshKey: string | null;
++}
++
++const PER_PAGE = 25;
++const STATUS_ORDER = ['FAIL', 'PASS', 'MANUAL'];
++
++function severityClass(severity: string): string {
++  const s = severity.toLowerCase();
++  if (s === 'critical') return 'bg-red-900/50 text-red-300';
++  if (s === 'high') return 'bg-amber-900/50 text-amber-300';
++  if (s === 'medium') return 'bg-blue-900/50 text-blue-300';
++  return 'bg-slate-800 text-slate-400';
++}
++
++function statusClass(status: string): string {
++  if (status === 'FAIL') return 'bg-red-950/60 text-red-400 border-red-900/40';
++  if (status === 'PASS') return 'bg-emerald-950/50 text-emerald-400 border-emerald-900/40';
++  if (status === 'MANUAL') return 'bg-amber-950/50 text-amber-400 border-amber-900/40';
++  return 'bg-slate-900 text-slate-400 border-slate-800';
++}
++
++// Scan files are untrusted input: only ever link to http(s) URLs (never javascript: etc).
++function safeUrl(url: string | null): string | null {
++  return url && /^https?:\/\//i.test(url) ? url : null;
++}
++
++function Detail({ label, children }: { label: string; children: React.ReactNode }) {
++  return (
++    <div>
++      <div className="text-[8px] uppercase tracking-widest font-bold text-slate-500 mb-1">{label}</div>
++      <div className="text-[10px] text-slate-300 leading-relaxed break-words whitespace-pre-wrap">{children}</div>
++    </div>
++  );
++}
++
++function FindingDetails({ f }: { f: ProwlerScanFinding }) {
++  const link = safeUrl(f.remediation_url);
++  const compliance = f.compliance ? Object.entries(f.compliance) : [];
++
++  return (
++    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-slate-900/40 border-t border-slate-800">
++      <Detail label="Finding">{f.detail || '-'}</Detail>
++      <Detail label="Check">
++        {f.check_title}
++        <div className="text-slate-500 mt-0.5">{f.check_id}</div>
++      </Detail>
++      {f.description && <Detail label="Description">{f.description}</Detail>}
++      {f.risk && <Detail label="Risk">{f.risk}</Detail>}
++      {(f.remediation || link) && (
++        <Detail label="Remediation">
++          {f.remediation}
++          {link && (
++            <a
++              href={link}
++              target="_blank"
++              rel="noopener noreferrer"
++              className="flex items-center gap-1 text-cyan-400 hover:text-cyan-300 mt-1"
++            >
++              <ExternalLink size={10} /> Documentation
++            </a>
++          )}
++        </Detail>
++      )}
++      <Detail label="Resource">
++        {f.resource_name}
++        {f.resource_type && <div className="text-slate-500 mt-0.5">{f.resource_type}</div>}
++        {f.resource_uid && <div className="text-slate-500 mt-0.5 break-all">{f.resource_uid}</div>}
++      </Detail>
++      <Detail label="Scope">
++        {f.account ? `Subscription: ${f.account}` : 'Subscription: -'}
++        <div className="text-slate-500 mt-0.5">Region: {f.region || '-'}</div>
++        <div className="text-slate-500 mt-0.5">Scanned: {new Date(f.scanned_at).toLocaleString()}</div>
++      </Detail>
++      {compliance.length > 0 && (
++        <div className="md:col-span-2">
++          <Detail label="Compliance frameworks">
++            <div className="flex flex-wrap gap-1.5 mt-0.5">
++              {compliance.map(([framework, reqs]) => (
++                <span key={framework} className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-[9px]">
++                  <span className="text-slate-200 font-bold">{framework}</span>
++                  <span className="text-slate-500"> {Array.isArray(reqs) ? reqs.slice(0, 6).join(', ') : String(reqs)}</span>
++                </span>
++              ))}
++            </div>
++          </Detail>
++        </div>
++      )}
++    </div>
++  );
++}
++
++export default function ProwlerFindingsTable({ refreshKey }: ProwlerFindingsTableProps) {
++  const [status, setStatus] = useState('');
++  const [severity, setSeverity] = useState('');
++  const [service, setService] = useState('');
++  const [search, setSearch] = useState('');
++  const [query, setQuery] = useState(''); // debounced copy of `search`
++  const [page, setPage] = useState(1);
++  const [data, setData] = useState<ProwlerFindingsPage | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState<string | null>(null);
++  const [expanded, setExpanded] = useState<number | null>(null);
++
++  useEffect(() => {
++    const t = setTimeout(() => {
++      setQuery(search);
++      setPage(1);
++    }, 300);
++    return () => clearTimeout(t);
++  }, [search]);
++
++  useEffect(() => {
++    let cancelled = false;
++    setLoading(true);
++
++    const params = new URLSearchParams({ page: String(page), perPage: String(PER_PAGE) });
++    if (status) params.set('status', status);
++    if (severity) params.set('severity', severity);
++    if (service) params.set('service', service);
++    if (query) params.set('q', query);
++
++    fetch(`/api/prowler/all-findings?${params.toString()}`)
++      .then((res) => {
++        if (!res.ok) throw new Error(`Server returned ${res.status}`);
++        return res.json();
++      })
++      .then((json: ProwlerFindingsPage) => {
++        if (cancelled) return;
++        setData(json);
++        setError(null);
++        setExpanded(null);
++      })
++      .catch((err) => {
++        if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load findings');
++      })
++      .finally(() => {
++        if (!cancelled) setLoading(false);
++      });
++
++    return () => {
++      cancelled = true;
++    };
++  }, [status, severity, service, query, page, refreshKey]);
++
++  const changeFilter = (setter: (v: string) => void) => (value: string) => {
++    setter(value);
++    setPage(1);
++  };
++
++  const statusFacets: Record<string, number> = data?.facets.status ?? {};
++  const severityFacets: Record<string, number> = data?.facets.severity ?? {};
++  const serviceFacets: Record<string, number> = data?.facets.service ?? {};
++  const totalInScan = Object.values(statusFacets).reduce((a, b) => a + b, 0);
++  const statusKeys = [
++    ...STATUS_ORDER.filter((k) => k in statusFacets),
++    ...Object.keys(statusFacets).filter((k) => !STATUS_ORDER.includes(k))
++  ];
++
++  const selectClass =
++    'bg-slate-950 border border-slate-800 text-[10px] px-2.5 py-2 rounded-lg font-mono text-slate-300 focus:outline-none focus:border-red-500';
++
++  return (
++    <div className="space-y-4">
++      {/* Filters */}
++      <div className="flex flex-col lg:flex-row gap-3 lg:items-center justify-between bg-slate-900/40 border border-slate-800 p-4 rounded-xl">
++        <div className="flex flex-wrap items-center gap-1 bg-slate-950 p-1 border border-slate-800 rounded-lg self-start">
++          <button
++            type="button"
++            onClick={() => changeFilter(setStatus)('')}
++            className={`px-3 py-1 text-[9px] uppercase font-bold font-mono rounded-md transition ${
++              status === '' ? 'bg-red-950 border border-red-900/30 text-red-400' : 'text-slate-500 hover:text-slate-300'
++            }`}
++          >
++            All ({totalInScan})
++          </button>
++          {statusKeys.map((k) => (
++            <button
++              key={k}
++              type="button"
++              onClick={() => changeFilter(setStatus)(k)}
++              className={`px-3 py-1 text-[9px] uppercase font-bold font-mono rounded-md transition ${
++                status === k ? 'bg-red-950 border border-red-900/30 text-red-400' : 'text-slate-500 hover:text-slate-300'
++              }`}
++            >
++              {k} ({statusFacets[k]})
++            </button>
++          ))}
++        </div>
++
++        <div className="flex flex-wrap gap-2 items-center">
++          <select aria-label="Severity" className={selectClass} value={severity} onChange={(e) => changeFilter(setSeverity)(e.target.value)}>
++            <option value="">All severities</option>
++            {Object.entries(severityFacets).map(([k, n]) => (
++              <option key={k} value={k.toLowerCase()}>{k} ({n})</option>
++            ))}
++          </select>
++          <select aria-label="Service" className={selectClass} value={service} onChange={(e) => changeFilter(setService)(e.target.value)}>
++            <option value="">All services</option>
++            {Object.entries(serviceFacets).map(([k, n]) => (
++              <option key={k} value={k}>{k} ({n})</option>
++            ))}
++          </select>
++          <div className="relative">
++            <Search size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-600" />
++            <input
++              type="text"
++              aria-label="Search findings"
++              placeholder="SEARCH CHECK, RESOURCE, DETAIL..."
++              value={search}
++              onChange={(e) => setSearch(e.target.value)}
++              className="w-64 bg-slate-950 border border-slate-800 text-[10px] pl-7 pr-3 py-2 rounded-lg font-mono text-slate-200 focus:outline-none focus:border-red-500 placeholder-slate-700 uppercase tracking-wider"
++            />
++          </div>
++        </div>
++      </div>
++
++      {error && (
++        <div className="border border-red-500/30 bg-red-950/20 text-red-400 p-3 rounded-lg text-[10px] font-mono">
++          Could not load findings: {error}
++        </div>
++      )}
++
++      {/* Table */}
++      <div className="border border-slate-800 bg-slate-950 rounded-xl overflow-hidden shadow-lg">
++        {data && totalInScan === 0 ? (
++          <div className="text-center p-10 text-slate-500 font-mono text-[10px] uppercase tracking-widest">
++            No Prowler scan data yet. Run a scan and upload the results.
++          </div>
++        ) : (
++          <div className="overflow-x-auto">
++            <table className="w-full text-left font-mono text-[10px] text-slate-300">
++              <thead>
++                <tr className="border-b border-slate-800 bg-slate-900/50 text-slate-400 select-none">
++                  <th className="p-3 w-6"></th>
++                  <th className="p-3 uppercase font-bold tracking-wider text-[9px]">Status</th>
++                  <th className="p-3 uppercase font-bold tracking-wider text-[9px]">Severity</th>
++                  <th className="p-3 uppercase font-bold tracking-wider text-[9px]">Service</th>
++                  <th className="p-3 uppercase font-bold tracking-wider text-[9px]">Check</th>
++                  <th className="p-3 uppercase font-bold tracking-wider text-[9px]">Resource</th>
++                  <th className="p-3 uppercase font-bold tracking-wider text-[9px]">Region</th>
++                </tr>
++              </thead>
++              <tbody>
++                {data?.findings.length === 0 && !loading && (
++                  <tr>
++                    <td colSpan={7} className="text-center p-8 text-slate-500">NO FINDINGS MATCH THESE FILTERS.</td>
++                  </tr>
++                )}
++                {data?.findings.map((f) => {
++                  const open = expanded === f.id;
++                  return (
++                    <React.Fragment key={f.id}>
++                      <tr
++                        data-testid="finding-row"
++                        tabIndex={0}
++                        aria-expanded={open}
++                        onClick={() => setExpanded(open ? null : f.id)}
++                        onKeyDown={(e) => {
++                          if (e.key === 'Enter' || e.key === ' ') {
++                            e.preventDefault();
++                            setExpanded(open ? null : f.id);
++                          }
++                        }}
++                        className="border-b border-slate-900 hover:bg-slate-900/40 cursor-pointer transition-colors"
++                      >
++                        <td className="p-3 text-slate-600">
++                          {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
++                        </td>
++                        <td className="p-3">
++                          <span className={`px-2 py-0.5 rounded font-black text-[9px] border uppercase ${statusClass(f.status)}`}>{f.status}</span>
++                        </td>
++                        <td className="p-3">
++                          <span className={`px-1.5 py-0.5 rounded text-[8px] uppercase font-bold ${severityClass(f.severity)}`}>{f.severity}</span>
++                        </td>
++                        <td className="p-3 text-slate-400">{f.service}</td>
++                        <td className="p-3 max-w-[280px]">
++                          <div className="truncate text-slate-200" title={f.check_title}>{f.check_title}</div>
++                          <div className="truncate text-slate-600 text-[9px]">{f.check_id}</div>
++                        </td>
++                        <td className="p-3 max-w-[220px] truncate" title={f.resource_uid || f.resource_name}>{f.resource_name}</td>
++                        <td className="p-3 text-slate-400">{f.region || '-'}</td>
++                      </tr>
++                      {open && (
++                        <tr data-testid="finding-details">
++                          <td colSpan={7} className="p-0">
++                            <FindingDetails f={f} />
++                          </td>
++                        </tr>
++                      )}
++                    </React.Fragment>
++                  );
++                })}
++              </tbody>
++            </table>
++          </div>
++        )}
++
++        {/* Pagination */}
++        {data && totalInScan > 0 && (
++          <div className="border-t border-slate-800 bg-slate-900/40 p-4 flex items-center justify-between font-mono">
++            <p className="text-[10px] text-slate-500">
++              <span className="text-slate-300 font-bold">{data.total}</span> FINDINGS · PAGE{' '}
++              <span className="text-slate-300 font-bold">{data.page}</span> / <span className="text-slate-300 font-bold">{data.pages}</span>
++            </p>
++            <div className="flex gap-1.5">
++              <button
++                type="button"
++                aria-label="Previous page"
++                disabled={page <= 1}
++                onClick={() => setPage((p) => Math.max(1, p - 1))}
++                className="p-1 px-3 border border-slate-800 rounded-lg text-slate-500 hover:text-slate-300 disabled:opacity-30"
++              >
++                <ChevronLeft size={13} />
++              </button>
++              <button
++                type="button"
++                aria-label="Next page"
++                disabled={page >= data.pages}
++                onClick={() => setPage((p) => p + 1)}
++                className="p-1 px-3 border border-slate-800 rounded-lg text-slate-500 hover:text-slate-300 disabled:opacity-30"
++              >
++                <ChevronRight size={13} />
++              </button>
++            </div>
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/src/components/ProwlerPanel.tsx b/src/components/ProwlerPanel.tsx
+index dd1385f..498c1b0 100644
+--- a/src/components/ProwlerPanel.tsx
++++ b/src/components/ProwlerPanel.tsx
+@@ -5,6 +5,7 @@ import { ProwlerMetrics, ProwlerFinding } from '../types';
+ interface ProwlerPanelProps {
+   metrics: ProwlerMetrics;
+   findings: ProwlerFinding[];
++  onViewAll?: () => void;
+ }
+ 
+ function severityBadgeClass(severity: string): string {
+@@ -16,7 +17,7 @@ function severityBadgeClass(severity: string): string {
+   return 'bg-slate-800 text-slate-400';
+ }
+ 
+-export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
++export default function ProwlerPanel({ metrics, findings, onViewAll }: ProwlerPanelProps) {
+   return (
+     <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[520px] shadow-sm">
+       <div className="bg-slate-900/80 p-3 border-b border-slate-800 flex justify-between items-center">
+@@ -31,16 +32,27 @@ export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
+ 
+         <div className="grid grid-cols-2 gap-3 mb-4">
+           <div className="bg-emerald-950/20 border border-emerald-900/30 p-2 rounded-lg">
+-            <div className="text-[9px] text-emerald-500/70 font-bold uppercase mb-1">Passed Checks</div>
++            <div className="text-[9px] text-emerald-500/70 font-bold uppercase mb-1">Passed · whole scan</div>
+             <div className="text-xl text-emerald-400 font-black">{metrics.passes}</div>
+           </div>
+           <div className="bg-red-950/20 border border-red-900/30 p-2 rounded-lg">
+-            <div className="text-[9px] text-red-500/70 font-bold uppercase mb-1">Failed Checks</div>
++            <div className="text-[9px] text-red-500/70 font-bold uppercase mb-1">Failed · whole scan</div>
+             <div className="text-xl text-red-400 font-black">{metrics.fails}</div>
+           </div>
+         </div>
+ 
+-        <h3 className="text-[10px] font-bold uppercase text-slate-500 mb-3 border-b border-slate-800 pb-1">NSG Rule Violations</h3>
++        <div className="flex items-center justify-between mb-3 border-b border-slate-800 pb-1">
++          <h3 className="text-[10px] font-bold uppercase text-slate-500">NSG Rule Violations</h3>
++          {onViewAll && (
++            <button
++              type="button"
++              onClick={onViewAll}
++              className="text-[9px] font-bold uppercase tracking-wider text-cyan-400 hover:text-cyan-300 transition"
++            >
++              View all findings →
++            </button>
++          )}
++        </div>
+ 
+         {findings.length === 0 ? (
+           <div className="text-[10px] text-slate-600 italic text-center py-8 border border-slate-800 rounded-lg">
+diff --git a/src/components/StatTiles.tsx b/src/components/StatTiles.tsx
+index 82a76dd..f524b15 100644
+--- a/src/components/StatTiles.tsx
++++ b/src/components/StatTiles.tsx
+@@ -4,9 +4,11 @@ import { SecurityStats, ProwlerMetrics } from '../types';
+ interface StatTilesProps {
+   stats: SecurityStats;
+   prowlerMetrics: ProwlerMetrics;
++  // Failed NSG checks specifically (the headline pass/fail numbers cover the whole scan).
++  nsgViolations: number;
+ }
+ 
+-export default function StatTiles({ stats, prowlerMetrics }: StatTilesProps) {
++export default function StatTiles({ stats, prowlerMetrics, nsgViolations }: StatTilesProps) {
+   const totalChecks = prowlerMetrics.passes + prowlerMetrics.fails;
+   const complianceScore = totalChecks > 0 ? Math.round((prowlerMetrics.passes / totalChecks) * 100) : null;
+   const wazuhAlertCount = stats.source_breakdown?.wazuh ?? 0;
+@@ -37,7 +39,7 @@ export default function StatTiles({ stats, prowlerMetrics }: StatTilesProps) {
+       {/* NSG Rules - real failed-check count from the latest Prowler upload */}
+       <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-4 flex flex-col justify-between h-28 relative overflow-hidden backdrop-blur-sm shadow-md">
+         <span className="text-[10px] uppercase text-slate-500 font-bold tracking-wider">Misconfigured NSG Rules</span>
+-        <div className="text-2xl font-black text-amber-500">{prowlerMetrics.fails}</div>
++        <div className="text-2xl font-black text-amber-500">{nsgViolations}</div>
+         <span className="text-[9px] text-slate-400 font-bold uppercase tracking-wider">High Severity Exiled</span>
+       </div>
+ 
+diff --git a/src/components/TabNav.tsx b/src/components/TabNav.tsx
+index 0132871..27d994e 100644
+--- a/src/components/TabNav.tsx
++++ b/src/components/TabNav.tsx
+@@ -1,6 +1,6 @@
+ import React from 'react';
+ 
+-type TabId = 'dashboard' | 'logs' | 'threats' | 'simulator';
++type TabId = 'dashboard' | 'logs' | 'threats' | 'findings' | 'simulator';
+ 
+ interface TabNavProps {
+   activeTab: TabId;
+@@ -11,6 +11,7 @@ const TABS: Array<{ id: TabId; label: string }> = [
+   { id: 'dashboard', label: 'Overview Grid' },
+   { id: 'logs', label: 'Telemetry Logs' },
+   { id: 'threats', label: 'Threat Actors' },
++  { id: 'findings', label: 'Cloud Findings' },
+   { id: 'simulator', label: 'Direct Simulator' }
+ ];
+ 
+diff --git a/src/types.ts b/src/types.ts
+index 637193a..78620aa 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -61,3 +61,37 @@ export interface ProwlerFinding {
+   source: string | null;
+   scanned_at: string;
+ }
++
++// One finding from the latest Prowler scan (pass or fail), with its full detail.
++export interface ProwlerScanFinding {
++  id: number;
++  status: string;
++  severity: string;
++  check_id: string;
++  check_title: string;
++  service: string;
++  resource_name: string;
++  resource_uid: string | null;
++  resource_type: string | null;
++  region: string | null;
++  account: string | null;
++  detail: string | null;
++  description: string | null;
++  risk: string | null;
++  remediation: string | null;
++  remediation_url: string | null;
++  compliance: Record<string, string[]> | null;
++  scanned_at: string;
++}
++
++export interface ProwlerFindingsPage {
++  findings: ProwlerScanFinding[];
++  total: number;
++  page: number;
++  pages: number;
++  facets: {
++    status: Record<string, number>;
++    severity: Record<string, number>;
++    service: Record<string, number>;
++  };
++}
