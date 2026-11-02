@@ -24,15 +24,6 @@ export default function ThreatsPanel({ threatActors }: ThreatsPanelProps) {
   return (
     <div className="space-y-4">
 
-      <div className="bg-slate-900/30 border border-slate-800 p-5 rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h3 className="text-[10px] font-mono font-bold tracking-wider uppercase text-slate-300 mb-1">Host threat intelligence categorization</h3>
-          <p className="text-[10px] font-mono text-slate-500 font-normal leading-relaxed uppercase">
-            Aggregates incoming threat anomalies by IP origin address to formulate safety logs.
-          </p>
-        </div>
-      </div>
-
       <div className="grid grid-cols-1 gap-3">
         {threatActors.length === 0 ? (
           <div className="border border-slate-800 bg-slate-950 p-12 text-center text-slate-500 font-mono text-[10px] rounded-xl uppercase tracking-widest">
