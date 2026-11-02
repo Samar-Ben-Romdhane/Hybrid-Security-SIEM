@@ -30,7 +30,7 @@ export default function ProwlerPanel({ metrics, findings, onViewAll }: ProwlerPa
           <Globe size={14} className="text-cyan-400" />
           <span className="text-[10px] font-bold tracking-wider uppercase text-slate-200">CLOUD / AZURE (PROWLER)</span>
         </div>
-        <span className="text-[8px] text-blue-400 uppercase font-black bg-blue-950/40 px-2 py-0.5 border border-blue-900/30 rounded-full">AZ-EAST-US</span>
+        <span className="text-[8px] text-blue-400 uppercase font-black bg-blue-950/40 px-2 py-0.5 border border-blue-900/30 rounded-full">AZ-SWEDEN-CENTRAL</span>
       </div>
 
       <div className="p-4 overflow-y-auto flex-1 font-mono">
