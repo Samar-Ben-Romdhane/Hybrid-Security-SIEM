@@ -1,6 +1,6 @@
 import React from 'react';
 
-type TabId = 'dashboard' | 'logs' | 'threats' | 'simulator';
+type TabId = 'dashboard' | 'logs' | 'threats' | 'findings' | 'simulator';
 
 interface TabNavProps {
   activeTab: TabId;
@@ -11,6 +11,7 @@ const TABS: Array<{ id: TabId; label: string }> = [
   { id: 'dashboard', label: 'Overview Grid' },
   { id: 'logs', label: 'Telemetry Logs' },
   { id: 'threats', label: 'Threat Actors' },
+  { id: 'findings', label: 'Cloud Findings' },
   { id: 'simulator', label: 'Direct Simulator' }
 ];
 

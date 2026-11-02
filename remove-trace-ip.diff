@@ -1,0 +1,59 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index d01999e..cc8e612 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -430,15 +430,6 @@ export default function App() {
+     }
+   };
+ 
+-  // Trace an IP from the Threat Actors tab back to its most recent event and focus the map on it
+-  const handleTraceIP = (ip: string) => {
+-    const matched = events.find(e => e.ip === ip);
+-    if (matched) {
+-      setActiveTab('dashboard');
+-      setTimeout(() => focusMapOnCoordinates(matched), 200);
+-    }
+-  };
+-
+   // Trigger a same-origin demo Wazuh alert (unauthenticated /api/demo/* route -
+   // the real /api/wazuh/webhook stays protected by the ingestion API key)
+   const handleSimulateOnPrem = async () => {
+@@ -672,7 +663,7 @@ export default function App() {
+ 
+         {/* TAB 3: THREAT INTELLIGENCE PORTFOLIO */}
+         {activeTab === 'threats' && (
+-          <ThreatsPanel threatActors={threatActors} onSync={syncTelemetry} onTraceIP={handleTraceIP} />
++          <ThreatsPanel threatActors={threatActors} onSync={syncTelemetry} />
+         )}
+ 
+         {/* TAB 4: DIRECT DECOY ATTACK SIMULATOR */}
+diff --git a/src/components/ThreatsPanel.tsx b/src/components/ThreatsPanel.tsx
+index 4da20d7..80f1da8 100644
+--- a/src/components/ThreatsPanel.tsx
++++ b/src/components/ThreatsPanel.tsx
+@@ -8,10 +8,9 @@ const PAGE_SIZE = 10;
+ interface ThreatsPanelProps {
+   threatActors: ThreatActor[];
+   onSync: () => void;
+-  onTraceIP: (ip: string) => void;
+ }
+ 
+-export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: ThreatsPanelProps) {
++export default function ThreatsPanel({ threatActors, onSync }: ThreatsPanelProps) {
+   const [page, setPage] = useState(1);
+   const totalPages = Math.max(1, Math.ceil(threatActors.length / PAGE_SIZE));
+ 
+@@ -80,13 +79,6 @@ export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: Threat
+                     <p className="text-[8px] uppercase font-mono tracking-wider font-bold text-slate-500">Last Seen</p>
+                     <p className="text-[10px] font-mono font-medium text-slate-400">{formatLocalDateTime(actor.lastSeen)}</p>
+                   </div>
+-                  <button
+-                    onClick={() => onTraceIP(actor.ip)}
+-                    type="button"
+-                    className="px-3 py-1.5 border border-slate-850 hover:border-red-900/40 hover:bg-slate-950 text-slate-400 hover:text-red-400 text-[9px] font-mono font-bold rounded-lg transition uppercase tracking-widest"
+-                  >
+-                    Trace IP
+-                  </button>
+                 </div>
+               </div>
+             );

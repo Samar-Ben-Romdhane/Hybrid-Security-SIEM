@@ -10,7 +10,7 @@ index b9a2039..6f875aa 100644
 +# Patch files shared during development - apply them, never commit them
 +*.patch
 diff --git a/server.ts b/server.ts
-index 027a981..baaa3cb 100644
+index 2a11498..ee9c492 100644
 --- a/server.ts
 +++ b/server.ts
 @@ -14,7 +14,12 @@ dotenv.config();
@@ -27,7 +27,7 @@ index 027a981..baaa3cb 100644
  
  // --- Postgres connection pool ---
  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-@@ -156,6 +161,30 @@ async function initSchema() {
+@@ -113,6 +118,30 @@ async function initSchema() {
        scanned_at TIMESTAMPTZ NOT NULL
      );
    `);
@@ -58,7 +58,7 @@ index 027a981..baaa3cb 100644
  }
  
  function rowToEvent(row: any): AttackEvent {
-@@ -316,9 +345,21 @@ const PORT_KEYWORDS: Record<string, string> = {
+@@ -225,9 +254,21 @@ const PORT_KEYWORDS: Record<string, string> = {
    http: '80', https: '443', ftp: '21', telnet: '23', smb: '445', redis: '6379'
  };
  
@@ -81,7 +81,7 @@ index 027a981..baaa3cb 100644
    const lower = text.toLowerCase();
    for (const [keyword, port] of Object.entries(PORT_KEYWORDS)) {
      if (lower.includes(keyword)) return port;
-@@ -326,7 +367,9 @@ function extractPort(text: string): string {
+@@ -235,7 +276,9 @@ function extractPort(text: string): string {
    return '-';
  }
  
@@ -92,7 +92,7 @@ index 027a981..baaa3cb 100644
    const cidr = text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}\b/);
    if (cidr) return cidr[0];
    if (/\binternet\b/i.test(text) || /\bany\b/i.test(text)) return '0.0.0.0/0';
-@@ -344,13 +387,15 @@ async function replaceProwlerFindings(rawFailedChecks: any[]): Promise<ProwlerFi
+@@ -253,13 +296,15 @@ async function replaceProwlerFindings(rawFailedChecks: any[]): Promise<ProwlerFi
      const severity: string = check.severity || check.Severity || check.finding_info?.severity || 'Unknown';
      const detail: string = check.status_detail || check.message || check.StatusExtended || '';
  
@@ -110,7 +110,7 @@ index 027a981..baaa3cb 100644
        scanned_at: scannedAt
      };
    });
-@@ -942,72 +987,145 @@ app.post('/api/demo/wazuh-alert', async (req, res) => {
+@@ -858,72 +903,145 @@ app.post('/api/demo/wazuh-alert', async (req, res) => {
    }
  });
  
@@ -261,12 +261,12 @@ index 027a981..baaa3cb 100644
 -    check.Status === 'PASS' || check.status === 'Pass' || check.status_code === 'PASS' || check.finding_info?.status === 'Pass';
 -
 -  const nsgChecks = prowlerData.filter(isNsgCheck);
-+  const nsgChecks = items.filter(isNsgCheck);
- 
+-
 -  // Status extraction depends on the specific JSON output format used (V3 vs OCSF)
 -  let fails = 0;
 -  let passes = 0;
--
++  const nsgChecks = items.filter(isNsgCheck);
+ 
 -  let failedChecks: any[];
 -  if (nsgChecks.length > 0) {
 -    failedChecks = nsgChecks.filter(isFail);
@@ -304,7 +304,7 @@ index 027a981..baaa3cb 100644
    try {
      const metrics = await processProwlerUpload(req.body);
      res.json({ status: 'success', metrics });
-@@ -1050,6 +1168,61 @@ app.get('/api/prowler/findings', (req, res) => {
+@@ -966,6 +1084,61 @@ app.get('/api/prowler/findings', (req, res) => {
    res.json(latestProwlerFindings);
  });
  
@@ -367,10 +367,10 @@ index 027a981..baaa3cb 100644
  // Uses a Service Principal (--sp-env-auth) since interactive az-cli/browser
  // login isn't available from a server-side button click.
 diff --git a/src/App.tsx b/src/App.tsx
-index 5773b71..8a219c2 100644
+index d01999e..a60ee0f 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
-@@ -7,6 +7,7 @@ import StatTiles from './components/StatTiles';
+@@ -8,6 +8,7 @@ import StatTiles from './components/StatTiles';
  import TabNav from './components/TabNav';
  import WazuhPanel from './components/WazuhPanel';
  import ProwlerPanel from './components/ProwlerPanel';
@@ -378,7 +378,7 @@ index 5773b71..8a219c2 100644
  import ChartsPanel from './components/ChartsPanel';
  import SettingsPanel from './components/SettingsPanel';
  import LogsTable from './components/LogsTable';
-@@ -14,7 +15,7 @@ import ThreatsPanel from './components/ThreatsPanel';
+@@ -15,7 +16,7 @@ import ThreatsPanel from './components/ThreatsPanel';
  import SimulatorPanel from './components/SimulatorPanel';
  import Footer from './components/Footer';
  
@@ -387,7 +387,7 @@ index 5773b71..8a219c2 100644
  
  export default function App() {
    // Main Telemetry States
-@@ -605,7 +606,7 @@ export default function App() {
+@@ -617,7 +618,7 @@ export default function App() {
  
        <DashboardHeader sseStatus={sseStatus} />
  
@@ -396,7 +396,7 @@ index 5773b71..8a219c2 100644
  
        <TabNav activeTab={activeTab} onTabChange={handleTabChange} />
  
-@@ -617,7 +618,7 @@ export default function App() {
+@@ -629,7 +630,7 @@ export default function App() {
            <div className="space-y-4">
              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                <WazuhPanel events={wazuhRecentAlerts} timeStr={timeStr} />
@@ -405,7 +405,7 @@ index 5773b71..8a219c2 100644
              </div>
  
              <ChartsPanel
-@@ -663,6 +664,11 @@ export default function App() {
+@@ -675,6 +676,11 @@ export default function App() {
            <ThreatsPanel threatActors={threatActors} onSync={syncTelemetry} onTraceIP={handleTraceIP} />
          )}
  
@@ -419,12 +419,13 @@ index 5773b71..8a219c2 100644
            <SimulatorPanel
 diff --git a/src/components/ProwlerFindingsTable.tsx b/src/components/ProwlerFindingsTable.tsx
 new file mode 100644
-index 0000000..600fb8d
+index 0000000..ef03ea8
 --- /dev/null
 +++ b/src/components/ProwlerFindingsTable.tsx
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,311 @@
 +import React, { useEffect, useState } from 'react';
-+import { ChevronLeft, ChevronRight, ChevronDown, Search, ExternalLink } from 'lucide-react';
++import { ChevronRight, ChevronDown, Search, ExternalLink } from 'lucide-react';
++import Pagination from './Pagination';
 +import { ProwlerFindingsPage, ProwlerScanFinding } from '../types';
 +
 +interface ProwlerFindingsTableProps {
@@ -726,44 +727,18 @@ index 0000000..600fb8d
 +          </div>
 +        )}
 +
-+        {/* Pagination */}
 +        {data && totalInScan > 0 && (
-+          <div className="border-t border-slate-800 bg-slate-900/40 p-4 flex items-center justify-between font-mono">
-+            <p className="text-[10px] text-slate-500">
-+              <span className="text-slate-300 font-bold">{data.total}</span> FINDINGS · PAGE{' '}
-+              <span className="text-slate-300 font-bold">{data.page}</span> / <span className="text-slate-300 font-bold">{data.pages}</span>
-+            </p>
-+            <div className="flex gap-1.5">
-+              <button
-+                type="button"
-+                aria-label="Previous page"
-+                disabled={page <= 1}
-+                onClick={() => setPage((p) => Math.max(1, p - 1))}
-+                className="p-1 px-3 border border-slate-800 rounded-lg text-slate-500 hover:text-slate-300 disabled:opacity-30"
-+              >
-+                <ChevronLeft size={13} />
-+              </button>
-+              <button
-+                type="button"
-+                aria-label="Next page"
-+                disabled={page >= data.pages}
-+                onClick={() => setPage((p) => p + 1)}
-+                className="p-1 px-3 border border-slate-800 rounded-lg text-slate-500 hover:text-slate-300 disabled:opacity-30"
-+              >
-+                <ChevronRight size={13} />
-+              </button>
-+            </div>
-+          </div>
++          <Pagination page={data.page} totalPages={data.pages} total={data.total} pageSize={PER_PAGE} onPageChange={setPage} />
 +        )}
 +      </div>
 +    </div>
 +  );
 +}
 diff --git a/src/components/ProwlerPanel.tsx b/src/components/ProwlerPanel.tsx
-index dd1385f..498c1b0 100644
+index cdefa76..2e30383 100644
 --- a/src/components/ProwlerPanel.tsx
 +++ b/src/components/ProwlerPanel.tsx
-@@ -5,6 +5,7 @@ import { ProwlerMetrics, ProwlerFinding } from '../types';
+@@ -8,6 +8,7 @@ const PAGE_SIZE = 5;
  interface ProwlerPanelProps {
    metrics: ProwlerMetrics;
    findings: ProwlerFinding[];
@@ -771,16 +746,16 @@ index dd1385f..498c1b0 100644
  }
  
  function severityBadgeClass(severity: string): string {
-@@ -16,7 +17,7 @@ function severityBadgeClass(severity: string): string {
+@@ -19,7 +20,7 @@ function severityBadgeClass(severity: string): string {
    return 'bg-slate-800 text-slate-400';
  }
  
 -export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
 +export default function ProwlerPanel({ metrics, findings, onViewAll }: ProwlerPanelProps) {
+   const pg = usePagination(findings, PAGE_SIZE);
+ 
    return (
-     <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden flex flex-col h-[520px] shadow-sm">
-       <div className="bg-slate-900/80 p-3 border-b border-slate-800 flex justify-between items-center">
-@@ -31,16 +32,27 @@ export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
+@@ -36,16 +37,27 @@ export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
  
          <div className="grid grid-cols-2 gap-3 mb-4">
            <div className="bg-emerald-950/20 border border-emerald-900/30 p-2 rounded-lg">

@@ -65,21 +65,20 @@ export default function LogsTable({
       {/* Datagrid logs table */}
       <div className="border border-slate-800 bg-slate-950 rounded-xl overflow-hidden shadow-lg">
         <div className="overflow-x-auto">
-          <table className="w-full text-left font-mono text-[10px] text-slate-350">
+          <table className="w-full table-fixed text-left font-mono text-[10px] text-slate-350">
             <thead>
               <tr className="border-b border-slate-800 bg-slate-900/50 text-slate-400 select-none">
-                <th className="p-4 uppercase font-bold tracking-wider text-[9px]">Timestamp</th>
-                <th className="p-4 uppercase font-bold tracking-wider text-[9px]">Origin Host IP</th>
-                <th className="p-4 uppercase font-bold tracking-wider text-[9px]">Decoy Target</th>
-                <th className="p-4 uppercase font-bold tracking-wider text-[9px]">Geographic Origin</th>
-                <th className="p-4 uppercase font-bold tracking-wider text-[9px]">Captured Payload</th>
-                <th className="p-4 text-right uppercase font-bold tracking-wider text-[9px]">Action</th>
+                <th className="w-1/5 p-4 uppercase font-bold tracking-wider text-[9px]">Timestamp</th>
+                <th className="w-1/5 p-4 uppercase font-bold tracking-wider text-[9px]">Origin Host IP</th>
+                <th className="w-1/5 p-4 uppercase font-bold tracking-wider text-[9px]">Decoy Target</th>
+                <th className="w-1/5 p-4 uppercase font-bold tracking-wider text-[9px]">Geographic Origin</th>
+                <th className="w-1/5 p-4 uppercase font-bold tracking-wider text-[9px]">Captured Payload</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-900">
               {logs.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="text-center p-8 text-slate-500 font-mono">
+                  <td colSpan={5} className="text-center p-8 text-slate-500 font-mono">
                     NO SECURITY INCIDENT PACKETS REGISTERED LOGS.
                   </td>
                 </tr>
@@ -105,17 +104,8 @@ export default function LogsTable({
                       <td className="p-4 text-slate-300">
                         {log.city}, {log.country}
                       </td>
-                      <td className="p-4 max-w-xs truncate text-slate-400" title={log.payload}>
+                      <td className="p-4 truncate text-slate-400" title={log.payload}>
                         {log.payload}
-                      </td>
-                      <td className="p-4 text-right">
-                        <button
-                          onClick={() => onFocusMap(log)}
-                          type="button"
-                          className="px-3 py-1 select-none text-[9px] font-black border border-slate-800 hover:border-red-900/30 hover:bg-slate-900/50 rounded-lg text-slate-400 hover:text-red-400 transition"
-                        >
-                          LOCATE
-                        </button>
                       </td>
                     </tr>
                   );

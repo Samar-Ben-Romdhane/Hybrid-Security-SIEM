@@ -10,3 +10,6 @@ coverage/
 # esbuild output from `npm run dev` (npm run build writes to dist/ instead, already ignored above)
 /server.cjs
 /server.cjs.map
+
+# Patch files shared during development - apply them, never commit them
+*.patch

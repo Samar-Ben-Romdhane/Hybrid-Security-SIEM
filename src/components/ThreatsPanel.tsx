@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { RefreshCw, ChevronLeft, ChevronRight } from 'lucide-react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { ThreatActor } from '../types';
 import { formatLocalDateTime } from '../utils/time';
 
@@ -7,11 +7,9 @@ const PAGE_SIZE = 10;
 
 interface ThreatsPanelProps {
   threatActors: ThreatActor[];
-  onSync: () => void;
-  onTraceIP: (ip: string) => void;
 }
 
-export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: ThreatsPanelProps) {
+export default function ThreatsPanel({ threatActors }: ThreatsPanelProps) {
   const [page, setPage] = useState(1);
   const totalPages = Math.max(1, Math.ceil(threatActors.length / PAGE_SIZE));
 
@@ -33,13 +31,6 @@ export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: Threat
             Aggregates incoming threat anomalies by IP origin address to formulate safety logs.
           </p>
         </div>
-        <button
-          onClick={onSync}
-          type="button"
-          className="flex items-center gap-2 px-3.5 py-2 border border-slate-850 bg-slate-950 font-mono text-[9px] font-black rounded-lg hover:bg-slate-900 hover:border-slate-750 text-slate-400 hover:text-slate-200 transition uppercase tracking-wider"
-        >
-          <RefreshCw size={11} /> Sync state anomalies
-        </button>
       </div>
 
       <div className="grid grid-cols-1 gap-3">
@@ -80,13 +71,6 @@ export default function ThreatsPanel({ threatActors, onSync, onTraceIP }: Threat
                     <p className="text-[8px] uppercase font-mono tracking-wider font-bold text-slate-500">Last Seen</p>
                     <p className="text-[10px] font-mono font-medium text-slate-400">{formatLocalDateTime(actor.lastSeen)}</p>
                   </div>
-                  <button
-                    onClick={() => onTraceIP(actor.ip)}
-                    type="button"
-                    className="px-3 py-1.5 border border-slate-850 hover:border-red-900/40 hover:bg-slate-950 text-slate-400 hover:text-red-400 text-[9px] font-mono font-bold rounded-lg transition uppercase tracking-widest"
-                  >
-                    Trace IP
-                  </button>
                 </div>
               </div>
             );

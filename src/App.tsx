@@ -8,6 +8,7 @@ import StatTiles from './components/StatTiles';
 import TabNav from './components/TabNav';
 import WazuhPanel from './components/WazuhPanel';
 import ProwlerPanel from './components/ProwlerPanel';
+import ProwlerFindingsTable from './components/ProwlerFindingsTable';
 import ChartsPanel from './components/ChartsPanel';
 import SettingsPanel from './components/SettingsPanel';
 import LogsTable from './components/LogsTable';
@@ -15,7 +16,7 @@ import ThreatsPanel from './components/ThreatsPanel';
 import SimulatorPanel from './components/SimulatorPanel';
 import Footer from './components/Footer';
 
-type TabId = 'dashboard' | 'logs' | 'threats' | 'simulator';
+type TabId = 'dashboard' | 'logs' | 'threats' | 'findings' | 'simulator';
 
 export default function App() {
   // Main Telemetry States
@@ -430,15 +431,6 @@ export default function App() {
     }
   };
 
-  // Trace an IP from the Threat Actors tab back to its most recent event and focus the map on it
-  const handleTraceIP = (ip: string) => {
-    const matched = events.find(e => e.ip === ip);
-    if (matched) {
-      setActiveTab('dashboard');
-      setTimeout(() => focusMapOnCoordinates(matched), 200);
-    }
-  };
-
   // Trigger a same-origin demo Wazuh alert (unauthenticated /api/demo/* route -
   // the real /api/wazuh/webhook stays protected by the ingestion API key)
   const handleSimulateOnPrem = async () => {
@@ -617,7 +609,7 @@ export default function App() {
 
       <DashboardHeader sseStatus={sseStatus} />
 
-      <StatTiles stats={stats} prowlerMetrics={prowlerMetrics} />
+      <StatTiles stats={stats} prowlerMetrics={prowlerMetrics} nsgViolations={prowlerFindings.length} />
 
       <TabNav activeTab={activeTab} onTabChange={handleTabChange} />
 
@@ -629,7 +621,7 @@ export default function App() {
           <div className="space-y-4">
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <WazuhPanel events={wazuhRecentAlerts} timeStr={timeStr} />
-              <ProwlerPanel metrics={prowlerMetrics} findings={prowlerFindings} />
+              <ProwlerPanel metrics={prowlerMetrics} findings={prowlerFindings} onViewAll={() => setActiveTab('findings')} />
             </div>
 
             <ChartsPanel
@@ -672,7 +664,12 @@ export default function App() {
 
         {/* TAB 3: THREAT INTELLIGENCE PORTFOLIO */}
         {activeTab === 'threats' && (
-          <ThreatsPanel threatActors={threatActors} onSync={syncTelemetry} onTraceIP={handleTraceIP} />
+          <ThreatsPanel threatActors={threatActors} />
+        )}
+
+        {/* TAB: EVERY PROWLER FINDING, WITH FULL DETAIL */}
+        {activeTab === 'findings' && (
+          <ProwlerFindingsTable refreshKey={prowlerMetrics.updated_at} />
         )}
 
         {/* TAB 4: DIRECT DECOY ATTACK SIMULATOR */}

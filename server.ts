@@ -14,7 +14,12 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json());
+// Whole Prowler scan files (thousands of findings) are far larger than the default
+// 100kb JSON limit, so that one route gets a bigger limit - but it is parsed only AFTER
+// the bearer-token check, so an unauthenticated caller can't make us buffer a huge body.
+const jsonParser = express.json();
+const prowlerUploadParser = express.json({ limit: '50mb' });
+app.use((req, res, next) => (req.path === '/api/prowler/upload' ? next() : jsonParser(req, res, next)));
 
 // --- Postgres connection pool ---
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -110,6 +115,30 @@ async function initSchema() {
       detail TEXT,
       port TEXT,
       source TEXT,
+      scanned_at TIMESTAMPTZ NOT NULL
+    );
+  `);
+
+  // Every finding from the latest Prowler scan (pass AND fail), with full detail.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS prowler_scan_findings (
+      id SERIAL PRIMARY KEY,
+      status TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      check_id TEXT NOT NULL,
+      check_title TEXT NOT NULL,
+      service TEXT NOT NULL,
+      resource_name TEXT NOT NULL,
+      resource_uid TEXT,
+      resource_type TEXT,
+      region TEXT,
+      account TEXT,
+      detail TEXT,
+      description TEXT,
+      risk TEXT,
+      remediation TEXT,
+      remediation_url TEXT,
+      compliance JSONB,
       scanned_at TIMESTAMPTZ NOT NULL
     );
   `);
@@ -225,9 +254,21 @@ const PORT_KEYWORDS: Record<string, string> = {
   http: '80', https: '443', ftp: '21', telnet: '23', smb: '445', redis: '6379'
 };
 
-function extractPort(text: string): string {
+// The check ID is the most reliable signal (it can't be polluted by an NSG or
+// subscription that happens to be named "ssh-something"), so use it first and
+// only fall back to scanning the free-text message.
+const CHECK_ID_PORTS: Array<[string, string]> = [
+  ['_ssh_', '22'], ['_rdp_', '3389'], ['_https_', '443'], ['_http_', '80'], ['_udp_', 'UDP']
+];
+
+function extractPort(text: string, checkId: string = ''): string {
+  const id = checkId.toLowerCase();
+  for (const [needle, port] of CHECK_ID_PORTS) {
+    if (id.includes(needle)) return port;
+  }
   const explicit = text.match(/port\s+(\d{1,5})/i) || text.match(/:(\d{1,5})\b/);
   if (explicit) return explicit[1];
+  if (id) return '-'; // known check with no port meaning: don't guess from names in the text
   const lower = text.toLowerCase();
   for (const [keyword, port] of Object.entries(PORT_KEYWORDS)) {
     if (lower.includes(keyword)) return port;
@@ -235,7 +276,9 @@ function extractPort(text: string): string {
   return '-';
 }
 
-function extractSource(text: string): string {
+function extractSource(text: string, checkId: string = ''): string {
+  // A FAIL on an *_internet_access_restricted check means the NSG allows it from the Internet.
+  if (/internet_access_restricted/i.test(checkId)) return 'Internet';
   const cidr = text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}\b/);
   if (cidr) return cidr[0];
   if (/\binternet\b/i.test(text) || /\bany\b/i.test(text)) return '0.0.0.0/0';
@@ -253,13 +296,15 @@ async function replaceProwlerFindings(rawFailedChecks: any[]): Promise<ProwlerFi
     const severity: string = check.severity || check.Severity || check.finding_info?.severity || 'Unknown';
     const detail: string = check.status_detail || check.message || check.StatusExtended || '';
 
+    const checkId: string = String(check.metadata?.event_code || check.CheckID || '');
+
     return {
       check_title: String(checkTitle).slice(0, 300),
       resource_name: String(resourceName).slice(0, 200),
       severity: String(severity).slice(0, 50),
       detail: String(detail).slice(0, 500),
-      port: extractPort(detail),
-      source: extractSource(detail),
+      port: extractPort(detail, checkId),
+      source: extractSource(detail, checkId),
       scanned_at: scannedAt
     };
   });
@@ -875,72 +920,145 @@ app.post('/api/demo/wazuh-alert', async (req, res) => {
   }
 });
 
-// Shared logic for turning raw Prowler JSON output into compliance metrics and
-// persisting them, used by both the protected external upload route and the
-// unauthenticated in-dashboard demo trigger below.
+// ---- Prowler: helpers shared by the summary metrics and the full findings view ----
+const isProwlerFail = (check: any): boolean =>
+  check.Status === 'FAIL' || check.status === 'Fail' || check.status_code === 'FAIL' || check.finding_info?.status === 'Fail';
+const isProwlerPass = (check: any): boolean =>
+  check.Status === 'PASS' || check.status === 'Pass' || check.status_code === 'PASS' || check.finding_info?.status === 'Pass';
+
+interface NormalizedProwlerFinding {
+  status: string; severity: string; check_id: string; check_title: string; service: string;
+  resource_name: string; resource_uid: string; resource_type: string; region: string; account: string;
+  detail: string; description: string; risk: string; remediation: string; remediation_url: string;
+  compliance: Record<string, unknown> | null;
+}
+
+const firstText = (...values: any[]): string => {
+  for (const v of values) {
+    if (typeof v === 'string' && v.trim() !== '') return v.trim();
+  }
+  return '';
+};
+const clip = (text: string, max = 4000): string => (text.length > max ? text.slice(0, max) + '…' : text);
+
+// Maps one raw Prowler finding (current OCSF output, or the legacy V3 native JSON)
+// onto the flat shape the dashboard stores. Field names follow Prowler's own OCSF writer:
+//   metadata.event_code = check ID          finding_info.title / .desc = check title / description
+//   status_code = PASS|FAIL                 status_detail (= message) = the specific result text
+//   risk_details = risk                     remediation.desc / .references = how to fix it
+//   resources[0].{name,uid,type,region,group.name = service}     cloud.account = subscription
+function normalizeProwlerFinding(check: any): NormalizedProwlerFinding {
+  const res = Array.isArray(check.resources) ? check.resources[0] : undefined;
+  const checkId = firstText(check.metadata?.event_code, check.CheckID, check.check_id);
+  const severity = firstText(check.severity, check.Severity).toLowerCase();
+  const compliance = check.unmapped?.compliance ?? check.Compliance;
+
+  let status = 'UNKNOWN';
+  if (isProwlerFail(check)) status = 'FAIL';
+  else if (isProwlerPass(check)) status = 'PASS';
+  else if ([check.status_code, check.Status].some((v) => String(v).toUpperCase() === 'MANUAL')) status = 'MANUAL';
+
+  return {
+    status,
+    severity: severity ? severity.charAt(0).toUpperCase() + severity.slice(1) : 'Unknown',
+    check_id: checkId || 'unknown',
+    check_title: clip(firstText(check.finding_info?.title, check.CheckTitle, checkId, 'Unknown check'), 500),
+    service: firstText(res?.group?.name, check.ServiceName, 'unknown').toLowerCase(),
+    resource_name: clip(firstText(res?.name, check.ResourceName, res?.uid, check.ResourceId, '-'), 500),
+    resource_uid: clip(firstText(res?.uid, check.ResourceId), 1000),
+    resource_type: clip(firstText(res?.type, check.ResourceType), 300),
+    region: firstText(res?.region, check.cloud?.region, check.Region),
+    account: clip(firstText(check.cloud?.account?.name, check.cloud?.account?.uid, check.AccountId), 300),
+    detail: clip(firstText(check.status_detail, check.message, check.StatusExtended)),
+    description: clip(firstText(check.finding_info?.desc, check.Description)),
+    risk: clip(firstText(check.risk_details, check.Risk)),
+    remediation: clip(firstText(check.remediation?.desc, check.Remediation?.Recommendation?.Text)),
+    remediation_url: clip(firstText(
+      Array.isArray(check.remediation?.references) ? check.remediation.references[0] : '',
+      check.Remediation?.Recommendation?.Url,
+      check.unmapped?.related_url
+    ), 1000),
+    compliance: compliance && typeof compliance === 'object' ? compliance : null
+  };
+}
+
+// Each scan is a point-in-time snapshot: replace the previous one atomically.
+async function replaceAllProwlerFindings(findings: NormalizedProwlerFinding[]) {
+  const rows = findings.slice(0, 20000);
+  const scannedAt = new Date().toISOString();
+  const COLS = 17;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM prowler_scan_findings');
+    for (let i = 0; i < rows.length; i += 200) {
+      const params: any[] = [];
+      const tuples = rows.slice(i, i + 200).map((r, idx) => {
+        params.push(r.status, r.severity, r.check_id, r.check_title, r.service, r.resource_name, r.resource_uid,
+          r.resource_type, r.region, r.account, r.detail, r.description, r.risk, r.remediation, r.remediation_url,
+          r.compliance ? JSON.stringify(r.compliance) : null, scannedAt);
+        const base = idx * COLS;
+        return '(' + Array.from({ length: COLS }, (_, k) => `$${base + k + 1}`).join(',') + ')';
+      });
+      await client.query(
+        `INSERT INTO prowler_scan_findings (status, severity, check_id, check_title, service, resource_name,
+           resource_uid, resource_type, region, account, detail, description, risk, remediation, remediation_url,
+           compliance, scanned_at) VALUES ${tuples.join(',')}`,
+        params
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Shared logic for turning raw Prowler JSON output into compliance metrics + stored findings,
+// used by the protected upload route, the demo trigger, and the on-demand Azure scan.
 async function processProwlerUpload(prowlerData: unknown) {
   if (!Array.isArray(prowlerData)) {
     throw Object.assign(new Error('Expected an array of Prowler JSON results'), { statusCode: 400 });
   }
+  const items = prowlerData.filter((c) => c && typeof c === 'object');
 
-  // Handle the legacy Prowler V3 native JSON format and the current OCSF v1.1.0
-  // format (default output since Prowler v4). Field mapping per Prowler's own
-  // v3 -> OCSF migration table:
-  //   CheckID -> metadata.event_code | ServiceName -> resources[].group.name
-  //   ResourceType -> resources[].type | Status -> status_code
+  // Real Azure NSG checks in Prowler are named network_{ssh,rdp,http,https,tcp,udp}_internet_access_restricted
+  // (plus network_subnet_nsg_associated) and report on microsoft.network/networksecuritygroups.
+  // Other checks in the "network" service (Bastion, flow logs, DDoS, Network Watcher, Shodan)
+  // are NOT NSG rule findings, so matching on the service name alone would be far too broad.
+  const NSG_CHECK_ID = /^network_(ssh|rdp|http|https|tcp|udp)_internet_access_restricted$|nsg|security_group/;
   const isNsgCheck = (check: any): boolean => {
-    // Legacy V3 native JSON
-    if (check.ServiceName === 'virtualnetwork' && check.ResourceType === 'networksecuritygroups') return true;
-    if (typeof check.CheckID === 'string' && check.CheckID.toLowerCase().includes('security_group')) return true;
+    const checkId = String(check.metadata?.event_code || check.CheckID || '').toLowerCase();
+    if (NSG_CHECK_ID.test(checkId)) return true;
 
-    // Current OCSF v1.1.0 (default since Prowler v4/v5)
-    const eventCode: string = check.metadata?.event_code || '';
-    if (eventCode.toLowerCase().includes('security_group')) return true;
-
-    const resources: any[] = Array.isArray(check.resources) ? check.resources : [];
-    return resources.some((r) =>
-      r?.group?.name?.toLowerCase?.().includes('network') ||
-      r?.type?.toLowerCase?.().includes('networksecuritygroup')
-    );
+    const resourceTypes: string[] = [
+      check.ResourceType,
+      ...(Array.isArray(check.resources) ? check.resources.map((r: any) => r?.type) : [])
+    ].filter(Boolean).map((t) => String(t).toLowerCase());
+    return resourceTypes.some((t) => t.includes('networksecuritygroup'));
   };
 
-  const isFail = (check: any): boolean =>
-    check.Status === 'FAIL' || check.status === 'Fail' || check.status_code === 'FAIL' || check.finding_info?.status === 'Fail';
-  const isPass = (check: any): boolean =>
-    check.Status === 'PASS' || check.status === 'Pass' || check.status_code === 'PASS' || check.finding_info?.status === 'Pass';
+  const nsgChecks = items.filter(isNsgCheck);
 
-  const nsgChecks = prowlerData.filter(isNsgCheck);
+  // Headline pass/fail numbers cover the WHOLE scan, so they always agree with the
+  // Cloud Findings tab. The NSG panel is the NSG-only subset of the failures.
+  const fails = items.filter(isProwlerFail).length;
+  const passes = items.filter(isProwlerPass).length;
 
-  // Status extraction depends on the specific JSON output format used (V3 vs OCSF)
-  let fails = 0;
-  let passes = 0;
-
-  let failedChecks: any[];
-  if (nsgChecks.length > 0) {
-    failedChecks = nsgChecks.filter(isFail);
-    fails = failedChecks.length;
-    passes = nsgChecks.filter(isPass).length;
-  } else {
-    // If no specific NSG checks found, just sum overall passes/fails for the PoC
-    failedChecks = prowlerData.filter(isFail);
-    fails = failedChecks.length;
-    passes = prowlerData.filter(isPass).length;
-  }
-
-  // Persist the real per-finding detail behind the aggregate counts, so the
-  // dashboard's violations table can show actual scan results instead of
-  // static sample rows.
-  await replaceProwlerFindings(failedChecks);
+  await replaceProwlerFindings(nsgChecks.filter(isProwlerFail));
+  await replaceAllProwlerFindings(items.map(normalizeProwlerFinding));
 
   return upsertProwlerMetrics({
-    total_nsg_checks: nsgChecks.length > 0 ? nsgChecks.length : prowlerData.length,
+    total_nsg_checks: nsgChecks.length,
     fails,
     passes
   });
 }
 
 // POST /api/prowler/upload - Ingest Prowler JSON output (external integration - API key protected)
-app.post('/api/prowler/upload', prowlerAuth, async (req, res) => {
+app.post('/api/prowler/upload', prowlerAuth, prowlerUploadParser, async (req, res) => {
   try {
     const metrics = await processProwlerUpload(req.body);
     res.json({ status: 'success', metrics });
@@ -981,6 +1099,61 @@ app.get('/api/prowler/metrics', (req, res) => {
 // GET /api/prowler/findings - Real per-finding detail behind the aggregate metrics
 app.get('/api/prowler/findings', (req, res) => {
   res.json(latestProwlerFindings);
+});
+
+// GET /api/prowler/all-findings - Every finding from the latest scan, filterable + paginated.
+// Query: status, severity, service, q (free text), page, perPage (max 100)
+app.get('/api/prowler/all-findings', async (req, res) => {
+  try {
+    const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+    const page = Math.max(1, parseInt(str(req.query.page)) || 1);
+    const perPage = Math.min(100, Math.max(1, parseInt(str(req.query.perPage)) || 25));
+
+    const where: string[] = [];
+    const params: any[] = [];
+    const addFilter = (sql: string, value: string) => {
+      params.push(value);
+      where.push(sql.replace('?', `$${params.length}`));
+    };
+    if (str(req.query.status)) addFilter('status = ?', str(req.query.status).toUpperCase());
+    if (str(req.query.severity)) addFilter('LOWER(severity) = ?', str(req.query.severity).toLowerCase());
+    if (str(req.query.service)) addFilter('service = ?', str(req.query.service).toLowerCase());
+    if (str(req.query.q)) {
+      const like = '%' + str(req.query.q).replace(/[\\%_]/g, '\\$&') + '%';
+      params.push(like);
+      const n = params.length;
+      where.push(`(check_title ILIKE $${n} OR check_id ILIKE $${n} OR resource_name ILIKE $${n}
+        OR resource_uid ILIKE $${n} OR detail ILIKE $${n} OR region ILIKE $${n})`);
+    }
+    const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+
+    const total = (await pool.query(`SELECT COUNT(*)::int AS n FROM prowler_scan_findings ${whereSql}`, params)).rows[0].n;
+    const rows = (await pool.query(
+      `SELECT * FROM prowler_scan_findings ${whereSql}
+       ORDER BY (status = 'FAIL') DESC,
+         CASE LOWER(severity) WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+         service, check_id, resource_name
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, perPage, (page - 1) * perPage]
+    )).rows;
+
+    // Facet counts always describe the whole scan, so the filter chips don't jump around.
+    const facet = async (column: string) => {
+      const r = await pool.query(`SELECT ${column} AS k, COUNT(*)::int AS n FROM prowler_scan_findings GROUP BY ${column} ORDER BY n DESC`);
+      return Object.fromEntries(r.rows.map((x: any) => [x.k, x.n]));
+    };
+
+    res.json({
+      findings: rows.map((r: any) => ({ ...r, scanned_at: new Date(r.scanned_at).toISOString() })),
+      total,
+      page,
+      pages: Math.max(1, Math.ceil(total / perPage)),
+      facets: { status: await facet('status'), severity: await facet('severity'), service: await facet('service') }
+    });
+  } catch (err) {
+    console.error('GET /api/prowler/all-findings failed:', err);
+    res.status(500).json({ error: 'Failed to load findings' });
+  }
 });
 
 // --- Real on-demand Prowler scan against the actual Azure environment ---

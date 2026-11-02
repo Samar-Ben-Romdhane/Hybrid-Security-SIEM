@@ -8,6 +8,7 @@ const PAGE_SIZE = 5;
 interface ProwlerPanelProps {
   metrics: ProwlerMetrics;
   findings: ProwlerFinding[];
+  onViewAll?: () => void;
 }
 
 function severityBadgeClass(severity: string): string {
@@ -19,7 +20,7 @@ function severityBadgeClass(severity: string): string {
   return 'bg-slate-800 text-slate-400';
 }
 
-export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
+export default function ProwlerPanel({ metrics, findings, onViewAll }: ProwlerPanelProps) {
   const pg = usePagination(findings, PAGE_SIZE);
 
   return (
@@ -36,16 +37,27 @@ export default function ProwlerPanel({ metrics, findings }: ProwlerPanelProps) {
 
         <div className="grid grid-cols-2 gap-3 mb-4">
           <div className="bg-emerald-950/20 border border-emerald-900/30 p-2 rounded-lg">
-            <div className="text-[9px] text-emerald-500/70 font-bold uppercase mb-1">Passed Checks</div>
+            <div className="text-[9px] text-emerald-500/70 font-bold uppercase mb-1">Passed · whole scan</div>
             <div className="text-xl text-emerald-400 font-black">{metrics.passes}</div>
           </div>
           <div className="bg-red-950/20 border border-red-900/30 p-2 rounded-lg">
-            <div className="text-[9px] text-red-500/70 font-bold uppercase mb-1">Failed Checks</div>
+            <div className="text-[9px] text-red-500/70 font-bold uppercase mb-1">Failed · whole scan</div>
             <div className="text-xl text-red-400 font-black">{metrics.fails}</div>
           </div>
         </div>
 
-        <h3 className="text-[10px] font-bold uppercase text-slate-500 mb-3 border-b border-slate-800 pb-1">NSG Rule Violations</h3>
+        <div className="flex items-center justify-between mb-3 border-b border-slate-800 pb-1">
+          <h3 className="text-[10px] font-bold uppercase text-slate-500">NSG Rule Violations</h3>
+          {onViewAll && (
+            <button
+              type="button"
+              onClick={onViewAll}
+              className="text-[9px] font-bold uppercase tracking-wider text-cyan-400 hover:text-cyan-300 transition"
+            >
+              View all findings →
+            </button>
+          )}
+        </div>
 
         {findings.length === 0 ? (
           <div className="text-[10px] text-slate-600 italic text-center py-8 border border-slate-800 rounded-lg">

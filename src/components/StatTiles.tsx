@@ -4,9 +4,11 @@ import { SecurityStats, ProwlerMetrics } from '../types';
 interface StatTilesProps {
   stats: SecurityStats;
   prowlerMetrics: ProwlerMetrics;
+  // Failed NSG checks specifically (the headline pass/fail numbers cover the whole scan).
+  nsgViolations: number;
 }
 
-export default function StatTiles({ stats, prowlerMetrics }: StatTilesProps) {
+export default function StatTiles({ stats, prowlerMetrics, nsgViolations }: StatTilesProps) {
   const totalChecks = prowlerMetrics.passes + prowlerMetrics.fails;
   const complianceScore = totalChecks > 0 ? Math.round((prowlerMetrics.passes / totalChecks) * 100) : null;
   const wazuhAlertCount = stats.source_breakdown?.wazuh ?? 0;
@@ -37,7 +39,7 @@ export default function StatTiles({ stats, prowlerMetrics }: StatTilesProps) {
       {/* NSG Rules - real failed-check count from the latest Prowler upload */}
       <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-4 flex flex-col justify-between h-28 relative overflow-hidden backdrop-blur-sm shadow-md">
         <span className="text-[10px] uppercase text-slate-500 font-bold tracking-wider">Misconfigured NSG Rules</span>
-        <div className="text-2xl font-black text-amber-500">{prowlerMetrics.fails}</div>
+        <div className="text-2xl font-black text-amber-500">{nsgViolations}</div>
         <span className="text-[9px] text-slate-400 font-bold uppercase tracking-wider">High Severity Exiled</span>
       </div>
 

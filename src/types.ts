@@ -61,3 +61,37 @@ export interface ProwlerFinding {
   source: string | null;
   scanned_at: string;
 }
+
+// One finding from the latest Prowler scan (pass or fail), with its full detail.
+export interface ProwlerScanFinding {
+  id: number;
+  status: string;
+  severity: string;
+  check_id: string;
+  check_title: string;
+  service: string;
+  resource_name: string;
+  resource_uid: string | null;
+  resource_type: string | null;
+  region: string | null;
+  account: string | null;
+  detail: string | null;
+  description: string | null;
+  risk: string | null;
+  remediation: string | null;
+  remediation_url: string | null;
+  compliance: Record<string, string[]> | null;
+  scanned_at: string;
+}
+
+export interface ProwlerFindingsPage {
+  findings: ProwlerScanFinding[];
+  total: number;
+  page: number;
+  pages: number;
+  facets: {
+    status: Record<string, number>;
+    severity: Record<string, number>;
+    service: Record<string, number>;
+  };
+}
