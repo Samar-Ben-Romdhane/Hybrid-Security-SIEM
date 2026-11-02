@@ -15,12 +15,8 @@ export default function DashboardHeader({ sseStatus }: DashboardHeaderProps) {
       </div>
       <div className="flex flex-wrap gap-4 md:gap-6 text-[10px] uppercase tracking-widest">
         <div className="flex flex-col items-start md:items-end">
-          <span className="text-slate-500">System Uptime</span>
-          <span className="text-emerald-400 font-bold">142:12:09:44</span>
-        </div>
-        <div className="flex flex-col items-start md:items-end">
           <span className="text-slate-500">Azure Region</span>
-          <span className="text-blue-400 font-bold">East-US-2</span>
+          <span className="text-blue-400 font-bold">Sweden Central</span>
         </div>
         <div className="flex flex-col items-start md:items-end">
           <span className="text-slate-500">Active Listeners</span>
