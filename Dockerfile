@@ -26,7 +26,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     python3 -m venv /opt/prowler-venv && \
     /opt/prowler-venv/bin/pip install --no-cache-dir --upgrade pip && \
-    /opt/prowler-venv/bin/pip install --no-cache-dir prowler
+    /opt/prowler-venv/bin/pip install --no-cache-dir prowler==5.44.0
 ENV PROWLER_BIN=/opt/prowler-venv/bin/prowler
 
 COPY package.json package-lock.json ./
