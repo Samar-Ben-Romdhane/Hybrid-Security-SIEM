@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { AttackEvent, SecurityStats, ThreatActor, SystemSettings, ProwlerMetrics, ProwlerFinding } from './types';
+import { AttackEvent, SecurityStats, ThreatActor, SystemSettings, ProwlerMetrics, ProwlerFinding, WazuhAgentStatus } from './types';
 
 import AlertToasts from './components/AlertToasts';
-import { formatLocalDateTime } from './utils/time';
 import DashboardHeader from './components/DashboardHeader';
 import StatTiles from './components/StatTiles';
 import TabNav from './components/TabNav';
@@ -22,6 +21,7 @@ export default function App() {
   // Main Telemetry States
   const [events, setEvents] = useState<AttackEvent[]>([]);
   const [wazuhRecentAlerts, setWazuhRecentAlerts] = useState<AttackEvent[]>([]);
+  const [wazuhAgentStatus, setWazuhAgentStatus] = useState<WazuhAgentStatus>({ configured: false });
   const [stats, setStats] = useState<SecurityStats>({
     total_attacks: 0,
     unique_ips: 0,
@@ -55,12 +55,9 @@ export default function App() {
   const [logTotalPages, setLogTotalPages] = useState<number>(1);
   const [sseStatus, setSseStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
   const [selectedEvent, setSelectedEvent] = useState<AttackEvent | null>(null);
-  const [simulationStatus, setSimulationStatus] = useState<string | null>(null);
   const [cloudScanStatus, setCloudScanStatus] = useState<'idle' | 'running' | 'done' | 'failed'>('idle');
   const [cloudScanError, setCloudScanError] = useState<string | null>(null);
   const cloudScanPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [timeStr, setTimeStr] = useState<string>(formatLocalDateTime(new Date()));
-
   // Floating Warning Alerts Queue
   const [activeAlerts, setActiveAlerts] = useState<AttackEvent[]>([]);
 
@@ -110,14 +107,6 @@ export default function App() {
   const mapInstanceRef = useRef<any>(null);
   const markerGroupRef = useRef<any>(null);
 
-  // Update dynamic timestamp clock
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setTimeStr(formatLocalDateTime(new Date()));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
-
   const fetchProwlerMetrics = async () => {
     try {
       const res = await fetch('/api/prowler/metrics');
@@ -153,6 +142,18 @@ export default function App() {
     }
   };
 
+  // Real Wazuh Manager agent status (replaces the old hardcoded "AGENT ACTIVE" badge)
+  const fetchWazuhAgentStatus = async () => {
+    try {
+      const res = await fetch('/api/wazuh/agent-status');
+      if (res.ok) {
+        setWazuhAgentStatus(await res.json());
+      }
+    } catch (err) {
+      console.error('Error fetching Wazuh agent status:', err);
+    }
+  };
+
   const syncTelemetry = async () => {
     try {
       const statsRes = await fetch('/api/stats');
@@ -176,6 +177,7 @@ export default function App() {
       await fetchProwlerMetrics();
       await fetchProwlerFindings();
       await fetchWazuhRecentAlerts();
+      await fetchWazuhAgentStatus();
     } catch (err) {
       console.error('Error fetching dashboard metrics:', err);
     }
@@ -431,20 +433,6 @@ export default function App() {
     }
   };
 
-  // Trigger a same-origin demo Wazuh alert (unauthenticated /api/demo/* route -
-  // the real /api/wazuh/webhook stays protected by the ingestion API key)
-  const handleSimulateOnPrem = async () => {
-    setSimulationStatus('queueing');
-    try {
-      const res = await fetch('/api/demo/wazuh-alert', { method: 'POST' });
-      setSimulationStatus(res.ok ? 'compromised' : 'failed');
-    } catch (err) {
-      console.error(err);
-      setSimulationStatus('failed');
-    }
-    setTimeout(() => setSimulationStatus(null), 3000);
-  };
-
   // Trigger a real Prowler scan against Azure (Service Principal auth) and
   // poll until it finishes, since a real scan takes a couple of minutes.
   const handleSimulateCloud = async () => {
@@ -620,7 +608,7 @@ export default function App() {
         {activeTab === 'dashboard' && (
           <div className="space-y-4">
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <WazuhPanel events={wazuhRecentAlerts} timeStr={timeStr} />
+              <WazuhPanel events={wazuhRecentAlerts} agentStatus={wazuhAgentStatus} />
               <ProwlerPanel metrics={prowlerMetrics} findings={prowlerFindings} onViewAll={() => setActiveTab('findings')} />
             </div>
 
@@ -675,10 +663,8 @@ export default function App() {
         {/* TAB 4: DIRECT DECOY ATTACK SIMULATOR */}
         {activeTab === 'simulator' && (
           <SimulatorPanel
-            simulationStatus={simulationStatus}
             cloudScanStatus={cloudScanStatus}
             cloudScanError={cloudScanError}
-            onSimulateOnPrem={handleSimulateOnPrem}
             onSimulateCloud={handleSimulateCloud}
           />
         )}

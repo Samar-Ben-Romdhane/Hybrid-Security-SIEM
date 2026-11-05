@@ -2,7 +2,7 @@
  * Common Types for Honeypot Traffic Analyzer
  */
 
-export type AttackSource = 'generator' | 'decoy' | 'wazuh' | 'demo' | 'manual';
+export type AttackSource = 'generator' | 'decoy' | 'wazuh' | 'manual';
 
 export interface AttackEvent {
   id: string;
@@ -49,6 +49,18 @@ export interface ProwlerMetrics {
   fails: number;
   passes: number;
   updated_at: string | null;
+}
+
+export interface WazuhAgentStatus {
+  configured: boolean;
+  reachable?: boolean;
+  found?: boolean;
+  status?: 'active' | 'disconnected' | 'pending' | 'never_connected' | 'unknown';
+  version?: string | null;
+  lastKeepAlive?: string | null;
+  name?: string | null;
+  ip?: string | null;
+  error?: string;
 }
 
 export interface ProwlerFinding {

@@ -1,21 +1,44 @@
 import React from 'react';
 import { Server } from 'lucide-react';
-import { AttackEvent } from '../types';
+import { AttackEvent, WazuhAgentStatus } from '../types';
+import { formatLocalDateTime } from '../utils/time';
 import Pagination, { usePagination } from './Pagination';
 
 const PAGE_SIZE = 5;
 
 interface WazuhPanelProps {
   events: AttackEvent[];
-  timeStr: string;
+  agentStatus: WazuhAgentStatus;
 }
 
-export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
+// Turn the raw /api/wazuh/agent-status response into an honest badge + status
+// line instead of a hardcoded "AGENT ACTIVE" that never reflected reality.
+function describeAgentStatus(agentStatus: WazuhAgentStatus): { badge: string; badgeStyle: string; dotStyle: string; line: string } {
+  if (!agentStatus.configured) {
+    return { badge: 'NOT CONFIGURED', badgeStyle: 'text-slate-400 bg-slate-900/60 border-slate-700', dotStyle: 'bg-slate-500', line: 'Wazuh API not set up (WAZUH_API_URL / USER / PASSWORD)' };
+  }
+  if (!agentStatus.reachable) {
+    return { badge: 'UNREACHABLE', badgeStyle: 'text-red-400 bg-red-950/40 border-red-900/30', dotStyle: 'bg-red-500', line: agentStatus.error || 'Could not reach the Wazuh Manager API' };
+  }
+  if (!agentStatus.found) {
+    return { badge: 'AGENT NOT FOUND', badgeStyle: 'text-amber-400 bg-amber-950/40 border-amber-900/30', dotStyle: 'bg-amber-500', line: 'Check WAZUH_AGENT_ID' };
+  }
+  if (agentStatus.status === 'active') {
+    return { badge: 'AGENT ACTIVE', badgeStyle: 'text-emerald-400 bg-emerald-950/40 border-emerald-900/30', dotStyle: 'bg-emerald-400 animate-pulse', line: `Connected${agentStatus.version ? ` (v${agentStatus.version})` : ''}` };
+  }
+  if (agentStatus.status === 'disconnected') {
+    return { badge: 'DISCONNECTED', badgeStyle: 'text-red-400 bg-red-950/40 border-red-900/30', dotStyle: 'bg-red-500', line: `Disconnected${agentStatus.version ? ` (v${agentStatus.version})` : ''}` };
+  }
+  return { badge: (agentStatus.status || 'UNKNOWN').toUpperCase().replace('_', ' '), badgeStyle: 'text-amber-400 bg-amber-950/40 border-amber-900/30', dotStyle: 'bg-amber-500', line: agentStatus.version ? `v${agentStatus.version}` : 'Status unknown' };
+}
+
+export default function WazuhPanel({ events, agentStatus }: WazuhPanelProps) {
   // This panel is specifically labeled WAZUH - only show events that actually
-  // came from a real forwarded Wazuh alert, not the synthetic generator,
-  // decoy captures, or demo-button clicks.
+  // came from a real forwarded Wazuh alert, not the synthetic generator or
+  // decoy captures.
   const wazuhEvents = events.filter((e) => e.source === 'wazuh');
   const pg = usePagination(wazuhEvents, PAGE_SIZE);
+  const agentInfo = describeAgentStatus(agentStatus);
 
   return (
     <div className="bg-slate-900/20 border border-slate-800 rounded-xl overflow-hidden relative flex flex-col h-[520px] shadow-sm">
@@ -25,7 +48,7 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
           <span className="text-[10px] font-bold tracking-wider uppercase text-slate-200">ON-PREM / GNS3 (WAZUH)</span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-[8px] text-emerald-400 uppercase font-black bg-emerald-950/40 px-2 py-0.5 border border-emerald-900/30 rounded-full flex items-center gap-1"><div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></div> AGENT ACTIVE</span>
+          <span className={`text-[8px] uppercase font-black px-2 py-0.5 border rounded-full flex items-center gap-1 ${agentInfo.badgeStyle}`}><div className={`w-1.5 h-1.5 rounded-full ${agentInfo.dotStyle}`}></div> {agentInfo.badge}</span>
         </div>
       </div>
 
@@ -33,11 +56,11 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
         <div className="mb-4 bg-slate-900/50 p-3 rounded-lg border border-slate-800 flex justify-between items-center">
           <div>
             <div className="text-[9px] text-slate-400 uppercase tracking-widest font-bold mb-1">Agent Status</div>
-            <div className="text-[11px] text-emerald-400 font-bold">Connected (v4.3.10)</div>
+            <div className="text-[11px] text-slate-200 font-bold">{agentInfo.line}</div>
           </div>
           <div className="text-right">
             <div className="text-[9px] text-slate-400 uppercase tracking-widest font-bold mb-1">Last Keepalive</div>
-            <div className="text-[11px] text-slate-200">{timeStr}</div>
+            <div className="text-[11px] text-slate-200">{agentStatus.lastKeepAlive ? formatLocalDateTime(agentStatus.lastKeepAlive) : '—'}</div>
           </div>
         </div>
 

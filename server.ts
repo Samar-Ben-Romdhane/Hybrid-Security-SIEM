@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import net from 'net';
 import http from 'http';
+import https from 'https';
 import { spawn } from 'child_process';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
@@ -905,21 +906,6 @@ app.post('/api/wazuh/webhook', wazuhAuth, async (req, res) => {
   }
 });
 
-// POST /api/demo/wazuh-alert - Same-origin dashboard demo trigger (NOT for external systems,
-// intentionally not behind wazuhAuth/prowlerAuth so the "Simulate On-Prem Attack" button always works).
-app.post('/api/demo/wazuh-alert', async (req, res) => {
-  try {
-    const logged = await recordWazuhAlert({
-      rule: { id: '5712', description: 'sshd: brute force trying to get access to the system.' },
-      data: { srcip: `198.51.100.${Math.floor(Math.random() * 254 + 1)}` }
-    }, 'demo');
-    res.json({ status: 'success', event: logged });
-  } catch (err) {
-    console.error('POST /api/demo/wazuh-alert failed:', err);
-    res.status(500).json({ error: 'Failed to record demo alert' });
-  }
-});
-
 // ---- Prowler: helpers shared by the summary metrics and the full findings view ----
 const isProwlerFail = (check: any): boolean =>
   check.Status === 'FAIL' || check.status === 'Fail' || check.status_code === 'FAIL' || check.finding_info?.status === 'Fail';
@@ -1161,6 +1147,98 @@ app.get('/api/prowler/all-findings', async (req, res) => {
 // login isn't available from a server-side button click.
 const PROWLER_BIN = process.env.PROWLER_BIN || '/opt/prowler-venv/bin/prowler';
 const PROWLER_SCAN_DIR = '/tmp/prowler-scans';
+
+// --- Wazuh Manager API (agent status) ---
+// Separate from the webhook ingestion: this calls OUT to the Wazuh Manager's
+// own REST API (default port 55000) to ask "is the monitored-host agent
+// actually connected right now", instead of hardcoding it in the UI.
+// Self-signed cert by default on a typical Wazuh install - rejectUnauthorized
+// is off here for that reason; point WAZUH_API_URL at a trusted cert/proxy
+// if you need strict TLS verification.
+const wazuhInsecureAgent = new https.Agent({ rejectUnauthorized: false });
+
+function wazuhApiRequest(urlStr: string, options: { method: string; auth?: string; token?: string }): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlStr);
+    const headers: Record<string, string> = {};
+    if (options.auth) headers.Authorization = `Basic ${options.auth}`;
+    if (options.token) headers.Authorization = `Bearer ${options.token}`;
+
+    const req = https.request(
+      { hostname: url.hostname, port: url.port || 55000, path: url.pathname + url.search, method: options.method, headers, agent: wazuhInsecureAgent, timeout: 8000 },
+      (res) => {
+        let body = '';
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          if (!res.statusCode || res.statusCode >= 400) {
+            return reject(new Error(`Wazuh API ${options.method} ${url.pathname} -> HTTP ${res.statusCode}`));
+          }
+          try {
+            resolve(JSON.parse(body));
+          } catch {
+            reject(new Error('Wazuh API returned non-JSON response'));
+          }
+        });
+      }
+    );
+    req.on('timeout', () => req.destroy(new Error('Wazuh API request timed out')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+let wazuhApiToken: { token: string; expiresAt: number } | null = null;
+
+async function getWazuhApiToken(): Promise<string> {
+  const { WAZUH_API_URL, WAZUH_API_USER, WAZUH_API_PASSWORD } = process.env;
+  if (!WAZUH_API_URL || !WAZUH_API_USER || !WAZUH_API_PASSWORD) {
+    throw new Error('Wazuh API not configured (WAZUH_API_URL / WAZUH_API_USER / WAZUH_API_PASSWORD)');
+  }
+  if (wazuhApiToken && wazuhApiToken.expiresAt > Date.now()) {
+    return wazuhApiToken.token;
+  }
+  const auth = Buffer.from(`${WAZUH_API_USER}:${WAZUH_API_PASSWORD}`).toString('base64');
+  const body = await wazuhApiRequest(`${WAZUH_API_URL}/security/user/authenticate`, { method: 'POST', auth });
+  const token = body?.data?.token;
+  if (!token) throw new Error('Wazuh API authentication returned no token');
+  // Wazuh's default JWT lifetime is 900s - refresh a bit early to be safe.
+  wazuhApiToken = { token, expiresAt: Date.now() + 10 * 60 * 1000 };
+  return token;
+}
+
+// GET /api/wazuh/agent-status - Real connection state of the monitored-host
+// agent, pulled live from the Wazuh Manager API (not hardcoded).
+app.get('/api/wazuh/agent-status', async (req, res) => {
+  const { WAZUH_API_URL, WAZUH_API_USER, WAZUH_API_PASSWORD } = process.env;
+  if (!WAZUH_API_URL || !WAZUH_API_USER || !WAZUH_API_PASSWORD) {
+    return res.json({ configured: false });
+  }
+  try {
+    const agentId = process.env.WAZUH_AGENT_ID || '001';
+    const token = await getWazuhApiToken();
+    const data = await wazuhApiRequest(`${WAZUH_API_URL}/agents?agents_list=${encodeURIComponent(agentId)}`, { method: 'GET', token });
+    const agent = data?.data?.affected_items?.[0];
+    if (!agent) {
+      return res.json({ configured: true, reachable: true, found: false, agentId });
+    }
+    res.json({
+      configured: true,
+      reachable: true,
+      found: true,
+      status: agent.status || 'unknown',
+      version: agent.version || null,
+      lastKeepAlive: agent.lastKeepAlive || null,
+      name: agent.name || null,
+      ip: agent.ip || null
+    });
+  } catch (err: any) {
+    console.error('GET /api/wazuh/agent-status failed:', err.message);
+    // Wrong/expired token - drop it so the next poll re-authenticates instead
+    // of retrying the same stale token for another 10 minutes.
+    wazuhApiToken = null;
+    res.json({ configured: true, reachable: false, error: err.message });
+  }
+});
 
 interface CloudScanState {
   status: 'idle' | 'running' | 'done' | 'failed';

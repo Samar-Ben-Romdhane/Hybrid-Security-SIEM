@@ -1,0 +1,460 @@
+diff --git a/.env.example b/.env.example
+index a74b8dc..146d983 100644
+--- a/.env.example
++++ b/.env.example
+@@ -44,6 +44,23 @@ AZURE_CLIENT_SECRET=""
+ WAZUH_WEBHOOK_TOKEN="generate-a-random-secret-for-wazuh"
+ PROWLER_WEBHOOK_TOKEN="generate-a-random-secret-for-prowler"
+ 
++# --- Wazuh Manager API, used by GET /api/wazuh/agent-status ---
++# Separate from the webhook token above: this is the dashboard calling OUT to
++# the Wazuh Manager's own REST API (default port 55000) to show the real
++# connection state of the monitored-host agent, instead of a hardcoded badge.
++# WAZUH_API_URL: e.g. https://192.168.122.71:55000 (the Wazuh manager host, NOT the agent)
++# WAZUH_API_USER / WAZUH_API_PASSWORD: a Wazuh API user (check the manager's
++#   /var/ossec/api/configuration/api.yaml, or create one - the Wazuh dashboard's
++#   own 'wazuh-wui' account also works if you have its password).
++# WAZUH_AGENT_ID: the agent to report on (check with `/var/ossec/bin/agent_control -l`
++#   on the manager, or the Wazuh dashboard's Agents page). Defaults to "001".
++# Left unset, the dashboard shows an honest "NOT CONFIGURED" state instead of
++# guessing. Uses a self-signed cert by default, like a typical Wazuh install.
++WAZUH_API_URL=""
++WAZUH_API_USER=""
++WAZUH_API_PASSWORD=""
++WAZUH_AGENT_ID="001"
++
+ # Session cryptographic secret keys
+ SECRET_KEY="generate-a-secure-secret-key-string-here"
+ 
+diff --git a/server.ts b/server.ts
+index 38e5aa8..dbcac66 100644
+--- a/server.ts
++++ b/server.ts
+@@ -3,6 +3,7 @@ import path from 'path';
+ import fs from 'fs';
+ import net from 'net';
+ import http from 'http';
++import https from 'https';
+ import { spawn } from 'child_process';
+ import { createServer as createViteServer } from 'vite';
+ import dotenv from 'dotenv';
+@@ -860,21 +861,6 @@ app.post('/api/wazuh/webhook', wazuhAuth, async (req, res) => {
+   }
+ });
+ 
+-// POST /api/demo/wazuh-alert - Same-origin dashboard demo trigger (NOT for external systems,
+-// intentionally not behind wazuhAuth/prowlerAuth so the "Simulate On-Prem Attack" button always works).
+-app.post('/api/demo/wazuh-alert', async (req, res) => {
+-  try {
+-    const logged = await recordWazuhAlert({
+-      rule: { id: '5712', description: 'sshd: brute force trying to get access to the system.' },
+-      data: { srcip: `198.51.100.${Math.floor(Math.random() * 254 + 1)}` }
+-    }, 'demo');
+-    res.json({ status: 'success', event: logged });
+-  } catch (err) {
+-    console.error('POST /api/demo/wazuh-alert failed:', err);
+-    res.status(500).json({ error: 'Failed to record demo alert' });
+-  }
+-});
+-
+ // Shared logic for turning raw Prowler JSON output into compliance metrics and
+ // persisting them, used by both the protected external upload route and the
+ // unauthenticated in-dashboard demo trigger below.
+@@ -989,6 +975,98 @@ app.get('/api/prowler/findings', (req, res) => {
+ const PROWLER_BIN = process.env.PROWLER_BIN || '/opt/prowler-venv/bin/prowler';
+ const PROWLER_SCAN_DIR = '/tmp/prowler-scans';
+ 
++// --- Wazuh Manager API (agent status) ---
++// Separate from the webhook ingestion: this calls OUT to the Wazuh Manager's
++// own REST API (default port 55000) to ask "is the monitored-host agent
++// actually connected right now", instead of hardcoding it in the UI.
++// Self-signed cert by default on a typical Wazuh install - rejectUnauthorized
++// is off here for that reason; point WAZUH_API_URL at a trusted cert/proxy
++// if you need strict TLS verification.
++const wazuhInsecureAgent = new https.Agent({ rejectUnauthorized: false });
++
++function wazuhApiRequest(urlStr: string, options: { method: string; auth?: string; token?: string }): Promise<any> {
++  return new Promise((resolve, reject) => {
++    const url = new URL(urlStr);
++    const headers: Record<string, string> = {};
++    if (options.auth) headers.Authorization = `Basic ${options.auth}`;
++    if (options.token) headers.Authorization = `Bearer ${options.token}`;
++
++    const req = https.request(
++      { hostname: url.hostname, port: url.port || 55000, path: url.pathname + url.search, method: options.method, headers, agent: wazuhInsecureAgent, timeout: 8000 },
++      (res) => {
++        let body = '';
++        res.on('data', (chunk) => { body += chunk; });
++        res.on('end', () => {
++          if (!res.statusCode || res.statusCode >= 400) {
++            return reject(new Error(`Wazuh API ${options.method} ${url.pathname} -> HTTP ${res.statusCode}`));
++          }
++          try {
++            resolve(JSON.parse(body));
++          } catch {
++            reject(new Error('Wazuh API returned non-JSON response'));
++          }
++        });
++      }
++    );
++    req.on('timeout', () => req.destroy(new Error('Wazuh API request timed out')));
++    req.on('error', reject);
++    req.end();
++  });
++}
++
++let wazuhApiToken: { token: string; expiresAt: number } | null = null;
++
++async function getWazuhApiToken(): Promise<string> {
++  const { WAZUH_API_URL, WAZUH_API_USER, WAZUH_API_PASSWORD } = process.env;
++  if (!WAZUH_API_URL || !WAZUH_API_USER || !WAZUH_API_PASSWORD) {
++    throw new Error('Wazuh API not configured (WAZUH_API_URL / WAZUH_API_USER / WAZUH_API_PASSWORD)');
++  }
++  if (wazuhApiToken && wazuhApiToken.expiresAt > Date.now()) {
++    return wazuhApiToken.token;
++  }
++  const auth = Buffer.from(`${WAZUH_API_USER}:${WAZUH_API_PASSWORD}`).toString('base64');
++  const body = await wazuhApiRequest(`${WAZUH_API_URL}/security/user/authenticate`, { method: 'POST', auth });
++  const token = body?.data?.token;
++  if (!token) throw new Error('Wazuh API authentication returned no token');
++  // Wazuh's default JWT lifetime is 900s - refresh a bit early to be safe.
++  wazuhApiToken = { token, expiresAt: Date.now() + 10 * 60 * 1000 };
++  return token;
++}
++
++// GET /api/wazuh/agent-status - Real connection state of the monitored-host
++// agent, pulled live from the Wazuh Manager API (not hardcoded).
++app.get('/api/wazuh/agent-status', async (req, res) => {
++  const { WAZUH_API_URL, WAZUH_API_USER, WAZUH_API_PASSWORD } = process.env;
++  if (!WAZUH_API_URL || !WAZUH_API_USER || !WAZUH_API_PASSWORD) {
++    return res.json({ configured: false });
++  }
++  try {
++    const agentId = process.env.WAZUH_AGENT_ID || '001';
++    const token = await getWazuhApiToken();
++    const data = await wazuhApiRequest(`${WAZUH_API_URL}/agents?agents_list=${encodeURIComponent(agentId)}`, { method: 'GET', token });
++    const agent = data?.data?.affected_items?.[0];
++    if (!agent) {
++      return res.json({ configured: true, reachable: true, found: false, agentId });
++    }
++    res.json({
++      configured: true,
++      reachable: true,
++      found: true,
++      status: agent.status || 'unknown',
++      version: agent.version || null,
++      lastKeepAlive: agent.lastKeepAlive || null,
++      name: agent.name || null,
++      ip: agent.ip || null
++    });
++  } catch (err: any) {
++    console.error('GET /api/wazuh/agent-status failed:', err.message);
++    // Wrong/expired token - drop it so the next poll re-authenticates instead
++    // of retrying the same stale token for another 10 minutes.
++    wazuhApiToken = null;
++    res.json({ configured: true, reachable: false, error: err.message });
++  }
++});
++
+ interface CloudScanState {
+   status: 'idle' | 'running' | 'done' | 'failed';
+   startedAt: string | null;
+diff --git a/src/App.tsx b/src/App.tsx
+index e5866df..c742b3a 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -1,8 +1,7 @@
+ import React, { useState, useEffect, useRef } from 'react';
+-import { AttackEvent, SecurityStats, ThreatActor, SystemSettings, ProwlerMetrics, ProwlerFinding } from './types';
++import { AttackEvent, SecurityStats, ThreatActor, SystemSettings, ProwlerMetrics, ProwlerFinding, WazuhAgentStatus } from './types';
+ 
+ import AlertToasts from './components/AlertToasts';
+-import { formatLocalDateTime } from './utils/time';
+ import DashboardHeader from './components/DashboardHeader';
+ import StatTiles from './components/StatTiles';
+ import TabNav from './components/TabNav';
+@@ -21,6 +20,7 @@ export default function App() {
+   // Main Telemetry States
+   const [events, setEvents] = useState<AttackEvent[]>([]);
+   const [wazuhRecentAlerts, setWazuhRecentAlerts] = useState<AttackEvent[]>([]);
++  const [wazuhAgentStatus, setWazuhAgentStatus] = useState<WazuhAgentStatus>({ configured: false });
+   const [stats, setStats] = useState<SecurityStats>({
+     total_attacks: 0,
+     unique_ips: 0,
+@@ -54,11 +54,9 @@ export default function App() {
+   const [logTotalPages, setLogTotalPages] = useState<number>(1);
+   const [sseStatus, setSseStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
+   const [selectedEvent, setSelectedEvent] = useState<AttackEvent | null>(null);
+-  const [simulationStatus, setSimulationStatus] = useState<string | null>(null);
+   const [cloudScanStatus, setCloudScanStatus] = useState<'idle' | 'running' | 'done' | 'failed'>('idle');
+   const [cloudScanError, setCloudScanError] = useState<string | null>(null);
+   const cloudScanPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+-  const [timeStr, setTimeStr] = useState<string>(formatLocalDateTime(new Date()));
+ 
+   // Floating Warning Alerts Queue
+   const [activeAlerts, setActiveAlerts] = useState<AttackEvent[]>([]);
+@@ -109,14 +107,6 @@ export default function App() {
+   const mapInstanceRef = useRef<any>(null);
+   const markerGroupRef = useRef<any>(null);
+ 
+-  // Update dynamic timestamp clock
+-  useEffect(() => {
+-    const timer = setInterval(() => {
+-      setTimeStr(formatLocalDateTime(new Date()));
+-    }, 1000);
+-    return () => clearInterval(timer);
+-  }, []);
+-
+   const fetchProwlerMetrics = async () => {
+     try {
+       const res = await fetch('/api/prowler/metrics');
+@@ -152,6 +142,18 @@ export default function App() {
+     }
+   };
+ 
++  // Real Wazuh Manager agent status (replaces the old hardcoded "AGENT ACTIVE" badge)
++  const fetchWazuhAgentStatus = async () => {
++    try {
++      const res = await fetch('/api/wazuh/agent-status');
++      if (res.ok) {
++        setWazuhAgentStatus(await res.json());
++      }
++    } catch (err) {
++      console.error('Error fetching Wazuh agent status:', err);
++    }
++  };
++
+   const syncTelemetry = async () => {
+     try {
+       const statsRes = await fetch('/api/stats');
+@@ -175,6 +177,7 @@ export default function App() {
+       await fetchProwlerMetrics();
+       await fetchProwlerFindings();
+       await fetchWazuhRecentAlerts();
++      await fetchWazuhAgentStatus();
+     } catch (err) {
+       console.error('Error fetching dashboard metrics:', err);
+     }
+@@ -430,20 +433,6 @@ export default function App() {
+     }
+   };
+ 
+-  // Trigger a same-origin demo Wazuh alert (unauthenticated /api/demo/* route -
+-  // the real /api/wazuh/webhook stays protected by the ingestion API key)
+-  const handleSimulateOnPrem = async () => {
+-    setSimulationStatus('queueing');
+-    try {
+-      const res = await fetch('/api/demo/wazuh-alert', { method: 'POST' });
+-      setSimulationStatus(res.ok ? 'compromised' : 'failed');
+-    } catch (err) {
+-      console.error(err);
+-      setSimulationStatus('failed');
+-    }
+-    setTimeout(() => setSimulationStatus(null), 3000);
+-  };
+-
+   // Trigger a real Prowler scan against Azure (Service Principal auth) and
+   // poll until it finishes, since a real scan takes a couple of minutes.
+   const handleSimulateCloud = async () => {
+@@ -619,7 +608,7 @@ export default function App() {
+         {activeTab === 'dashboard' && (
+           <div className="space-y-4">
+             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+-              <WazuhPanel events={wazuhRecentAlerts} timeStr={timeStr} />
++              <WazuhPanel events={wazuhRecentAlerts} agentStatus={wazuhAgentStatus} />
+               <ProwlerPanel metrics={prowlerMetrics} findings={prowlerFindings} />
+             </div>
+ 
+@@ -669,10 +658,8 @@ export default function App() {
+         {/* TAB 4: DIRECT DECOY ATTACK SIMULATOR */}
+         {activeTab === 'simulator' && (
+           <SimulatorPanel
+-            simulationStatus={simulationStatus}
+             cloudScanStatus={cloudScanStatus}
+             cloudScanError={cloudScanError}
+-            onSimulateOnPrem={handleSimulateOnPrem}
+             onSimulateCloud={handleSimulateCloud}
+           />
+         )}
+diff --git a/src/components/SimulatorPanel.tsx b/src/components/SimulatorPanel.tsx
+index c9f247f..7ef3c9c 100644
+--- a/src/components/SimulatorPanel.tsx
++++ b/src/components/SimulatorPanel.tsx
+@@ -1,19 +1,15 @@
+ import React from 'react';
+-import { Zap, Server, Globe, CheckCircle2, AlertCircle, Sliders, Loader2 } from 'lucide-react';
++import { Zap, Globe, CheckCircle2, AlertCircle, Sliders, Loader2 } from 'lucide-react';
+ 
+ interface SimulatorPanelProps {
+-  simulationStatus: string | null;
+   cloudScanStatus: 'idle' | 'running' | 'done' | 'failed';
+   cloudScanError: string | null;
+-  onSimulateOnPrem: () => void;
+   onSimulateCloud: () => void;
+ }
+ 
+ export default function SimulatorPanel({
+-  simulationStatus,
+   cloudScanStatus,
+   cloudScanError,
+-  onSimulateOnPrem,
+   onSimulateCloud
+ }: SimulatorPanelProps) {
+   return (
+@@ -31,25 +27,9 @@ export default function SimulatorPanel({
+           </p>
+         </div>
+ 
+-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-6">
+-          {/* On-Prem Simulator */}
+-          <div className="bg-slate-950 p-4 border border-slate-800 rounded-lg flex flex-col gap-3">
+-            <div className="flex items-center gap-2 mb-2">
+-              <Server size={14} className="text-blue-400" />
+-              <span className="text-[10px] uppercase font-bold tracking-widest text-slate-300">GNS3 Local Node</span>
+-            </div>
+-            <p className="text-[9px] text-slate-500 uppercase leading-relaxed mb-2">
+-              Trigger a mock Wazuh alert for a brute force attack originating from an external IP against the local router.
+-            </p>
+-            <button
+-              type="button"
+-              disabled={simulationStatus === 'queueing'}
+-              onClick={onSimulateOnPrem}
+-              className="w-full py-2.5 bg-blue-900/40 hover:bg-blue-900/60 disabled:bg-slate-800 disabled:text-slate-550 border border-blue-900/50 text-blue-400 font-bold uppercase tracking-widest text-[9px] rounded-lg transition"
+-            >
+-              {simulationStatus === 'queueing' ? 'INJECTING...' : 'Simulate On-Prem Attack'}
+-            </button>
+-          </div>
++        <div className="grid grid-cols-1 gap-4 mt-6">
++          {/* On-Prem (GNS3) is monitored live by Wazuh already - no simulate button needed,
++              a real SSH/Telnet attempt against the monitored host shows up on its own. */}
+ 
+           {/* Cloud Simulator - triggers a REAL Prowler scan against Azure via a Service Principal */}
+           <div className="bg-slate-950 p-4 border border-slate-800 rounded-lg flex flex-col gap-3">
+@@ -78,18 +58,6 @@ export default function SimulatorPanel({
+         </div>
+ 
+         <div className="mt-4 space-y-2">
+-          {simulationStatus === 'compromised' && (
+-            <div className="border border-emerald-500/30 bg-emerald-950/20 text-emerald-400 p-3 rounded-lg flex items-center gap-2.5">
+-              <CheckCircle2 size={13} className="text-emerald-400" />
+-              <span className="font-extrabold uppercase text-[9px] tracking-wider">INJECTION SUCCESS: Security telemetry updated!</span>
+-            </div>
+-          )}
+-          {simulationStatus === 'failed' && (
+-            <div className="border border-red-500/30 bg-red-950/20 text-red-400 p-3 rounded-lg flex items-center gap-2.5">
+-              <AlertCircle size={13} className="text-red-400" />
+-              <span className="font-extrabold uppercase text-[9px] tracking-wider">INJECTION ERROR: Port stream transmission crashed.</span>
+-            </div>
+-          )}
+           {cloudScanStatus === 'done' && (
+             <div className="border border-emerald-500/30 bg-emerald-950/20 text-emerald-400 p-3 rounded-lg flex items-center gap-2.5">
+               <CheckCircle2 size={13} className="text-emerald-400" />
+diff --git a/src/components/WazuhPanel.tsx b/src/components/WazuhPanel.tsx
+index 9ebb1b2..d9bf31b 100644
+--- a/src/components/WazuhPanel.tsx
++++ b/src/components/WazuhPanel.tsx
+@@ -1,21 +1,44 @@
+ import React from 'react';
+ import { Server } from 'lucide-react';
+-import { AttackEvent } from '../types';
++import { AttackEvent, WazuhAgentStatus } from '../types';
++import { formatLocalDateTime } from '../utils/time';
+ import Pagination, { usePagination } from './Pagination';
+ 
+ const PAGE_SIZE = 5;
+ 
+ interface WazuhPanelProps {
+   events: AttackEvent[];
+-  timeStr: string;
++  agentStatus: WazuhAgentStatus;
+ }
+ 
+-export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
++// Turn the raw /api/wazuh/agent-status response into an honest badge + status
++// line instead of a hardcoded "AGENT ACTIVE" that never reflected reality.
++function describeAgentStatus(agentStatus: WazuhAgentStatus): { badge: string; badgeStyle: string; dotStyle: string; line: string } {
++  if (!agentStatus.configured) {
++    return { badge: 'NOT CONFIGURED', badgeStyle: 'text-slate-400 bg-slate-900/60 border-slate-700', dotStyle: 'bg-slate-500', line: 'Wazuh API not set up (WAZUH_API_URL / USER / PASSWORD)' };
++  }
++  if (!agentStatus.reachable) {
++    return { badge: 'UNREACHABLE', badgeStyle: 'text-red-400 bg-red-950/40 border-red-900/30', dotStyle: 'bg-red-500', line: agentStatus.error || 'Could not reach the Wazuh Manager API' };
++  }
++  if (!agentStatus.found) {
++    return { badge: 'AGENT NOT FOUND', badgeStyle: 'text-amber-400 bg-amber-950/40 border-amber-900/30', dotStyle: 'bg-amber-500', line: 'Check WAZUH_AGENT_ID' };
++  }
++  if (agentStatus.status === 'active') {
++    return { badge: 'AGENT ACTIVE', badgeStyle: 'text-emerald-400 bg-emerald-950/40 border-emerald-900/30', dotStyle: 'bg-emerald-400 animate-pulse', line: `Connected${agentStatus.version ? ` (v${agentStatus.version})` : ''}` };
++  }
++  if (agentStatus.status === 'disconnected') {
++    return { badge: 'DISCONNECTED', badgeStyle: 'text-red-400 bg-red-950/40 border-red-900/30', dotStyle: 'bg-red-500', line: `Disconnected${agentStatus.version ? ` (v${agentStatus.version})` : ''}` };
++  }
++  return { badge: (agentStatus.status || 'UNKNOWN').toUpperCase().replace('_', ' '), badgeStyle: 'text-amber-400 bg-amber-950/40 border-amber-900/30', dotStyle: 'bg-amber-500', line: agentStatus.version ? `v${agentStatus.version}` : 'Status unknown' };
++}
++
++export default function WazuhPanel({ events, agentStatus }: WazuhPanelProps) {
+   // This panel is specifically labeled WAZUH - only show events that actually
+-  // came from a real forwarded Wazuh alert, not the synthetic generator,
+-  // decoy captures, or demo-button clicks.
++  // came from a real forwarded Wazuh alert, not the synthetic generator or
++  // decoy captures.
+   const wazuhEvents = events.filter((e) => e.source === 'wazuh');
+   const pg = usePagination(wazuhEvents, PAGE_SIZE);
++  const agentInfo = describeAgentStatus(agentStatus);
+ 
+   return (
+     <div className="bg-slate-900/20 border border-slate-800 rounded-xl overflow-hidden relative flex flex-col h-[520px] shadow-sm">
+@@ -25,7 +48,7 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
+           <span className="text-[10px] font-bold tracking-wider uppercase text-slate-200">ON-PREM / GNS3 (WAZUH)</span>
+         </div>
+         <div className="flex items-center gap-2">
+-          <span className="text-[8px] text-emerald-400 uppercase font-black bg-emerald-950/40 px-2 py-0.5 border border-emerald-900/30 rounded-full flex items-center gap-1"><div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></div> AGENT ACTIVE</span>
++          <span className={`text-[8px] uppercase font-black px-2 py-0.5 border rounded-full flex items-center gap-1 ${agentInfo.badgeStyle}`}><div className={`w-1.5 h-1.5 rounded-full ${agentInfo.dotStyle}`}></div> {agentInfo.badge}</span>
+         </div>
+       </div>
+ 
+@@ -33,11 +56,11 @@ export default function WazuhPanel({ events, timeStr }: WazuhPanelProps) {
+         <div className="mb-4 bg-slate-900/50 p-3 rounded-lg border border-slate-800 flex justify-between items-center">
+           <div>
+             <div className="text-[9px] text-slate-400 uppercase tracking-widest font-bold mb-1">Agent Status</div>
+-            <div className="text-[11px] text-emerald-400 font-bold">Connected (v4.3.10)</div>
++            <div className="text-[11px] text-slate-200 font-bold">{agentInfo.line}</div>
+           </div>
+           <div className="text-right">
+             <div className="text-[9px] text-slate-400 uppercase tracking-widest font-bold mb-1">Last Keepalive</div>
+-            <div className="text-[11px] text-slate-200">{timeStr}</div>
++            <div className="text-[11px] text-slate-200">{agentStatus.lastKeepAlive ? formatLocalDateTime(agentStatus.lastKeepAlive) : '—'}</div>
+           </div>
+         </div>
+ 
+diff --git a/src/types.ts b/src/types.ts
+index 637193a..9181b14 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -2,7 +2,7 @@
+  * Common Types for Honeypot Traffic Analyzer
+  */
+ 
+-export type AttackSource = 'generator' | 'decoy' | 'wazuh' | 'demo' | 'manual';
++export type AttackSource = 'generator' | 'decoy' | 'wazuh' | 'manual';
+ 
+ export interface AttackEvent {
+   id: string;
+@@ -51,6 +51,18 @@ export interface ProwlerMetrics {
+   updated_at: string | null;
+ }
+ 
++export interface WazuhAgentStatus {
++  configured: boolean;
++  reachable?: boolean;
++  found?: boolean;
++  status?: 'active' | 'disconnected' | 'pending' | 'never_connected' | 'unknown';
++  version?: string | null;
++  lastKeepAlive?: string | null;
++  name?: string | null;
++  ip?: string | null;
++  error?: string;
++}
++
+ export interface ProwlerFinding {
+   id: number;
+   check_title: string;
