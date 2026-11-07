@@ -535,11 +535,8 @@ export default function App() {
     HTTP: '#fbbf24'   // amber 400
   };
 
-  // 2. Bar chart of top credential attacks
-  const barChartCredentials = stats.top_payloads.slice(0, 5).map(item => ({
-    name: item.payload.length > 22 ? item.payload.slice(0, 22) + '...' : item.payload,
-    Attempts: item.count
-  }));
+  // 2. Top attacker IPs by real hit count (already computed server-side)
+  const topAttackers = stats.top_attackers.slice(0, 5);
 
   // 3. Real hourly traffic density, computed server-side from actual event timestamps
   const timelineChartData = stats.hourly_timeline.map((b) => ({ hour: b.hour, Events: b.events }));
@@ -581,16 +578,6 @@ export default function App() {
   const telnetPercent = Math.round((telnetVal / totalCount) * 100);
   const httpPercent = Math.round((httpVal / totalCount) * 100);
 
-  const topPayloadLogs = stats.top_payloads.length > 0
-    ? stats.top_payloads.slice(0, 5)
-    : [
-        { payload: 'admin / admin', count: 42 },
-        { payload: 'root / 123456', count: 31 },
-        { payload: 'user / password', count: 18 },
-        { payload: 'guest / guest', count: 12 },
-        { payload: 'support / support', count: 5 }
-      ];
-
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 font-mono p-4 md:p-6 flex flex-col gap-4 selection:bg-red-500 selection:text-white overflow-x-hidden">
       <AlertToasts alerts={activeAlerts} onClear={clearAlert} onClearAll={clearAllAlerts} />
@@ -621,8 +608,7 @@ export default function App() {
               telnetVal={telnetVal}
               httpPercent={httpPercent}
               httpVal={httpVal}
-              barChartCredentials={barChartCredentials}
-              topPayloadLogs={topPayloadLogs}
+              topAttackers={topAttackers}
               timelineChartData={timelineChartData}
             />
 

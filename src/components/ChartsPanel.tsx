@@ -7,8 +7,6 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  BarChart,
-  Bar,
   Cell,
   PieChart,
   Pie
@@ -23,8 +21,7 @@ interface ChartsPanelProps {
   telnetVal: number;
   httpPercent: number;
   httpVal: number;
-  barChartCredentials: Array<{ name: string; Attempts: number }>;
-  topPayloadLogs: Array<{ payload: string; count: number }>;
+  topAttackers: Array<{ ip: string; country: string; count: number }>;
   timelineChartData: Array<{ hour: string; Events: number }>;
 }
 
@@ -37,10 +34,10 @@ export default function ChartsPanel({
   telnetVal,
   httpPercent,
   httpVal,
-  barChartCredentials,
-  topPayloadLogs,
+  topAttackers,
   timelineChartData
 }: ChartsPanelProps) {
+  const maxAttackerCount = Math.max(1, ...topAttackers.map((a) => a.count));
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
 
@@ -111,47 +108,38 @@ export default function ChartsPanel({
         </div>
       </div>
 
-      {/* Brute payloads attempted */}
+      {/* Top attacker IPs */}
       <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-4 flex flex-col justify-between min-h-[300px]">
         <div>
-          <h3 className="text-[10px] uppercase text-slate-500 mb-3 font-bold tracking-wider">Top brute credentials</h3>
-          <div className="space-y-1.5 font-mono text-[10px]">
-            <div className="flex justify-between font-bold text-slate-500 border-b border-slate-850 pb-1 uppercase tracking-wider">
-              <span>INTELLIGENCE PATH</span>
-              <span>ATTEMPTS</span>
-            </div>
-            {topPayloadLogs.map((p, idx) => (
-              <div key={idx} className="flex justify-between border-b border-slate-900 pb-1 pt-1 text-slate-300">
-                <span className="text-red-400 truncate max-w-[155px] font-bold">{p.payload}</span>
-                <span>{p.count}x</span>
+          <h3 className="text-[10px] uppercase text-slate-500 mb-1 font-bold tracking-wider">Top attacker IPs</h3>
+          <p className="text-[10px] font-mono text-slate-500 mb-3 leading-relaxed">
+            Most active source IPs by real hit count.
+          </p>
+          <div className="space-y-3 font-mono text-[10px]">
+            {topAttackers.map((a, idx) => (
+              <div key={`${a.ip}-${idx}`} className="flex flex-col gap-1">
+                <div className="flex justify-between">
+                  <span className="text-red-400 font-extrabold">{a.ip}</span>
+                  <span className="text-slate-400">{a.country} · {a.count}x</span>
+                </div>
+                <div className="w-full bg-slate-800 h-1 rounded-full overflow-hidden">
+                  <div className="bg-red-500 h-full" style={{ width: `${(a.count / maxAttackerCount) * 100}%` }}></div>
+                </div>
               </div>
             ))}
+            {topAttackers.length === 0 && (
+              <div className="text-slate-600 text-[10px] py-6 text-center">No real traffic recorded yet.</div>
+            )}
           </div>
-        </div>
-
-        <div className="h-20 mt-2">
-          {barChartCredentials.length > 0 ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={barChartCredentials} layout="vertical" margin={{ left: -32, right: 10 }}>
-                <XAxis type="number" stroke="#475569" style={{ fontSize: 8 }} />
-                <YAxis dataKey="name" type="category" stroke="#475569" width={90} style={{ fontSize: 7 }} />
-                <Bar dataKey="Attempts" fill="#ef4444" radius={[0, 4, 4, 0]}>
-                  {barChartCredentials.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill="#f87171" opacity={1 - index * 0.15} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          ) : null}
         </div>
       </div>
 
       {/* Historical Timeline block */}
       <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-4 flex flex-col justify-between min-h-[300px]">
         <div>
-          <h3 className="text-[10px] uppercase text-slate-500 mb-2 font-bold tracking-wider">Atemporal Traffic Density</h3>
+          <h3 className="text-[10px] uppercase text-slate-500 mb-2 font-bold tracking-wider">Activity over the last 24h</h3>
           <p className="text-[10px] font-mono text-slate-500 mb-3 leading-relaxed">
-            Active scanned attempts across chronological timeline blocks.
+            Real event count per 4-hour window.
           </p>
         </div>
         <div className="flex-1 h-36">
