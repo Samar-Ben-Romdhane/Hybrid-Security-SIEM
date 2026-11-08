@@ -11,23 +11,8 @@ This is a personal project and portfolio piece — it is **not** deployed in or 
 ---
 
 ## 🏗️ Architecture
-On-prem (GNS3 lab) Cloud (Azure) Local demo traffic
-┌───────────────────────┐ ┌───────────────────────────┐ ┌──────────────────────────┐
-│ monitored-host VM │ │ Azure subscription │ │ Decoy listeners │
-│ - Wazuh Manager │ │ - Scanned by Prowler │ │ (same Node process) │
-│ - Detects real SSH/ │ │ via a Service Principal │ │ - SSH :2222 │
-│ Telnet brute force │ │ (Reader role, read-only) │ │ - Telnet :2323 │
-└───────────┬────────────┘ └──────────────┬──────────────┘ │ - HTTP :8080 │
-│ custom integration script │ on-demand scan │ profile: standard / │
-│ → POST /api/wazuh/webhook │ POST /api/prowler/scan aggressive / stealth │
-▼ ▼ └─────────────┬────────────┘
-┌───────────────────────────────────────────────────────────────────────────────────────────┐
-│ Express API (server.ts) + PostgreSQL │
-│ events / prowler_findings / prowler_scan_findings / settings tables │
-│ GET /api/wazuh/agent-status (live agent status via the Wazuh Manager REST API) │
-│ GET /api/live (Server-Sent Events stream for the dashboard) │
-└───────────────────────────────────────────┬────────────────────────────────────────────────┘
-▼
+<img width="1536" height="1024" alt="Architecture réseau sécurisée avec Wazuh et Azure(2)" src="https://github.com/user-attachments/assets/de2d73cc-1574-448f-b68d-84a20fa2b735" />
+
 React (Vite + Tailwind) dashboard
 Overview Grid · ON-PREM/GNS3 (Wazuh) panel · Cloud/Prowler
 panel + full findings table · Direct Simulator · profiling controls
