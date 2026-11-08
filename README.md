@@ -34,7 +34,7 @@ panel + full findings table · Direct Simulator · profiling controls
 
 ---
 
-## \U0001F9E0 Key capabilities
+## Key capabilities
 
 - **Live Overview Grid** \u2014 protocol distribution, top attacker IPs, and a 24h activity timeline, all computed server-side from real event timestamps in Postgres.
 - **ON-PREM / GNS3 (WAZUH) panel** \u2014 live agent connection status via the Wazuh Manager REST API, with the alert feed showing only events actually forwarded by Wazuh.
