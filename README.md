@@ -36,10 +36,10 @@ panel + full findings table · Direct Simulator · profiling controls
 
 ## Key capabilities
 
-- **Live Overview Grid** \u2014 protocol distribution, top attacker IPs, and a 24h activity timeline, all computed server-side from real event timestamps in Postgres.
-- **ON-PREM / GNS3 (WAZUH) panel** \u2014 live agent connection status via the Wazuh Manager REST API, with the alert feed showing only events actually forwarded by Wazuh.
-- **Cloud / Prowler panel + full Findings table** \u2014 Azure compliance results, pushed from CI or triggered on demand from the dashboard.
-- **Direct Simulator** \u2014 one click runs a real, read-only Prowler scan against the configured Azure subscription.
+- **Live Overview Grid**  protocol distribution, top attacker IPs, and a 24h activity timeline, all computed server-side from real event timestamps in Postgres.
+- **ON-PREM / GNS3 (WAZUH) panel**  live agent connection status via the Wazuh Manager REST API, with the alert feed showing only events actually forwarded by Wazuh.
+- **Cloud / Prowler panel + full Findings table**  Azure compliance results, pushed from CI or triggered on demand from the dashboard.
+- **Direct Simulator**  one click runs a real, read-only Prowler scan against the configured Azure subscription.
 - **Active Security Engine Profiling Controls** \u2014 tune the alert threshold, toggle audio alerts, and switch the decoys between `standard`, `aggressive` (draws out more attacker interaction to capture post-auth behaviour) and `stealth` (minimizes the honeypot's fingerprint) response profiles.
 
 ---
